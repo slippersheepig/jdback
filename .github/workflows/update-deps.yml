@@ -51,9 +51,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git add requirements.txt
-          git commit -m "chore(deps): auto-update requirements.txt
-
-  Automated dependency update via pip-compile --upgrade."
+          git commit -m "chore(deps): auto-update requirements.txt" -m "Automated dependency update via pip-compile --upgrade."
           git push origin "$BRANCH"
           echo "branch=$BRANCH" >> "$GITHUB_ENV"
 
