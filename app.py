@@ -14,6 +14,8 @@ POST /api/jd-check
 from __future__ import annotations
 
 import functools
+import hmac
+import ipaddress
 import json
 import html
 import os
@@ -23,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.cookiejar import CookieJar
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
@@ -45,6 +47,7 @@ except ValueError:
     REQUEST_TIMEOUT = 30
 
 JD_DEBUG = _env("JD_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+ALLOW_INSECURE_YYB = _env("ALLOW_INSECURE_YYB", "0").lower() in {"1", "true", "yes", "on"}
 
 # ========== 常量 ==========
 
@@ -81,6 +84,43 @@ class CookieOpener:
 def redact_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     return urllib.parse.urlunparse(parsed._replace(query="", fragment=""))
+
+
+def _is_local_host(host: str) -> bool:
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def normalize_yyb_server(raw: str) -> str:
+    """规范化并校验 yyb 服务地址，避免凭据经由不可信明文链路发送。"""
+    value = str(raw or "").strip().splitlines()[0].rstrip("/")
+    if "@" in value:
+        value = value[: value.index("@")].rstrip("/")
+    if not value:
+        raise ValueError("缺少 yyb_server 参数")
+    if "://" not in value:
+        value = "https://" + value
+
+    parsed = urllib.parse.urlparse(value)
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"http", "https"} or not host:
+        raise ValueError("yyb_server 必须是有效的 HTTP/HTTPS 地址")
+    if parsed.username or parsed.password:
+        raise ValueError("yyb_server 不允许包含用户名或密码")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("yyb_server 不允许包含参数、查询字符串或片段")
+    if parsed.scheme != "https" and not (_is_local_host(host) or ALLOW_INSECURE_YYB):
+        raise ValueError(
+            "yyb_server 必须使用 HTTPS；如确需连接可信内网 HTTP 服务，"
+            "请设置 ALLOW_INSECURE_YYB=1"
+        )
+    return urllib.parse.urlunparse(
+        parsed._replace(path=parsed.path.rstrip("/"), params="", query="", fragment="")
+    )
 
 
 _DIAG_T0 = time.monotonic()
@@ -809,7 +849,7 @@ def require_token(f):
         if not auth_header.startswith("Bearer "):
             return jsonify({"status": "error", "message": "缺少 Bearer token"}), 401
         token = auth_header[7:]
-        if token != AUTORPOST_TOKEN:
+        if not hmac.compare_digest(token, AUTORPOST_TOKEN):
             return jsonify({"status": "error", "message": "无效的 token"}), 403
         return f(*args, **kwargs)
     return decorated
@@ -824,22 +864,19 @@ def health():
 @require_token
 def jd_check():
     body = request.get_json(silent=True) or {}
-    yyb_server = (body.get("yyb_server") or "").strip()
+    yyb_server_raw = (body.get("yyb_server") or "").strip()
     ref = (body.get("ref") or "").strip()
     app_id = (body.get("app_id") or "").strip() or None
 
-    if not yyb_server:
+    if not yyb_server_raw:
         return jsonify({"status": "error", "message": "缺少 yyb_server 参数"}), 400
     if not ref:
         return jsonify({"status": "error", "message": "缺少 ref 参数"}), 400
 
-    # 规范化 yyb_server URL
-    yyb_server = yyb_server.rstrip("/")
-    if not yyb_server.startswith("http"):
-        yyb_server = "http://" + yyb_server
-    # 去掉可能的 @ref 后缀
-    if "@" in yyb_server.splitlines()[0]:
-        yyb_server = yyb_server.splitlines()[0][:yyb_server.splitlines()[0].index("@")].rstrip("/")
+    try:
+        yyb_server = normalize_yyb_server(yyb_server_raw)
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
 
     try:
         cookie, risk_url = attempt_code_login(yyb_server, ref, full=False)
