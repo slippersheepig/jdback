@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-jdback — 京东小程序 code 登录 Flask Web 服务。
+jdback — 京东 code / wskey 登录 Flask Web 服务。
 
-通过调用 yyb 服务端 API 获取微信小程序 code，
-然后用 code 调用京东 login_lt 接口获取 pt_key/pt_pin cookie。
+端点:
+  POST /api/jd-check    — 小程序 code 登录（原有）
+  POST /api/jd-wskey    — wskey 转 cookie（新增）
 
-POST /api/jd-check
-  Body: {"yyb_server": "...", "ref": "...", "app_id": "..."}
-  Returns: {"status": "ok|risk|error", "jd_cookie": "...", "risk_url": "...", "message": "...", "pt_pin": "..."}
+wskey 是京东长期保活令牌，可通过 yyb_go 的 /wxapp/getJdWskey 接口获取。
+拿到 wskey 后调用本接口即可转换为 pt_key/pt_pin cookie。
 """
 
 from __future__ import annotations
@@ -48,6 +48,12 @@ except ValueError:
 
 JD_DEBUG = _env("JD_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
 ALLOW_INSECURE_YYB = _env("ALLOW_INSECURE_YYB", "0").lower() in {"1", "true", "yes", "on"}
+
+# 京东 wskey 转 cookie 的 UA（模拟京东 Android APP，与 appid=jd_android 渠道保持一致）
+JD_WSKEY_UA = (
+    "JD4Android/12.0.0;Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+)
 
 # ========== 常量 ==========
 
@@ -96,7 +102,6 @@ def _is_local_host(host: str) -> bool:
 
 
 def normalize_yyb_server(raw: str) -> str:
-    """规范化并校验 yyb 服务地址，避免凭据经由不可信明文链路发送。"""
     value = str(raw or "").strip().splitlines()[0].rstrip("/")
     if "@" in value:
         value = value[: value.index("@")].rstrip("/")
@@ -258,7 +263,6 @@ def request_json(
     yyb_server: str = "",
 ) -> Dict[str, Any]:
     merged_headers = dict(headers or {})
-    # 对 yyb server 的请求自动加 API Token 鉴权头
     if YYB_API_TOKEN and yyb_server and url.startswith(yyb_server):
         merged_headers.setdefault("Authorization", f"Bearer {YYB_API_TOKEN}")
     status, _headers, raw = request_text(method, url, merged_headers, data, opener)
@@ -279,7 +283,6 @@ def request_json(
 
 
 def unwrap_service_payload(payload: Any) -> Dict[str, Any]:
-    """兼容 yyb_go 的 {code, data, msg} 响应格式。"""
     if not isinstance(payload, dict):
         return {"value": payload}
     if "code" in payload and "data" in payload:
@@ -396,6 +399,23 @@ def cookie_pin(cookie: str) -> str:
     return match.group(1) if match else ""
 
 
+def pt_key_type(cookie: str) -> str:
+    """判断 pt_key 的签发渠道：
+    - "app"   : app_open 开头，京东 APP 渠道登录态（wskey 转换的典型产物）
+    - "wskey" : AAJ 开头（wskey 被直接当作 pt_key 使用）
+    - "wxapp" : 其他（小程序/H5 登录产物，yyb code 登录流程得到的就是这种）
+    """
+    match = re.search(r"(?:^|[;,\s])pt_key=([^;,\s]+)", str(cookie or ""))
+    if not match:
+        return ""
+    value = match.group(1)
+    if value.startswith("app_open"):
+        return "app"
+    if value.startswith("AAJf"):
+        return "wskey"
+    return "wxapp"
+
+
 def normalize_pin(pin: str) -> str:
     raw = str(pin or "").strip()
     if not raw:
@@ -419,7 +439,7 @@ def login_info(payload: Any) -> Dict[str, Any]:
     return payload
 
 
-# ========== 京东登录逻辑 ==========
+# ========== 京东 code 登录逻辑（原有）==========
 
 def get_yyb_code(
     yyb_server: str,
@@ -611,7 +631,6 @@ def follow_server_refresh(opener: CookieOpener, payload: Dict[str, Any]) -> str:
 
 
 def sfs_exchange_pt_key(opener: CookieOpener, payload: Dict[str, Any]) -> str:
-    """login_lt 没给 pt_key 但给了 sfstoken+pin 时，用 sfstoken 去换 pt_key。"""
     sfs = jar_get(opener.cookie_jar, "sfstoken")
     pin = jar_get(opener.cookie_jar, "pin") or jar_get(opener.cookie_jar, "pt_pin")
     if not sfs or not pin:
@@ -695,7 +714,6 @@ def jd_pt_html_redirect(base_url: str, raw: str) -> str:
 
 
 def jd_pt_cookie_login(code: str) -> str:
-    """移植 yyb_go_pure/internal/httpapi/jdpt.go 的 PT OAuth 跳转链。"""
     session = CookieOpener()
     login_url = "https://plogin.m.jd.com/user/login.action?" + urllib.parse.urlencode(
         {"appid": JD_PT_APP, "returnurl": JD_PT_RETURN_URL}
@@ -758,7 +776,6 @@ def jd_pt_cookie_login(code: str) -> str:
 
 
 def exchange_pt_cookie(yyb_server: str, ref: str) -> str:
-    """使用 yyb_go 重新取 PT 专用 code，再执行 jdpt.go 的 OAuth 链。"""
     pt_code = get_yyb_code(yyb_server, ref, app_id=JD_PT_APPID)
     return jd_pt_cookie_login(pt_code)
 
@@ -768,12 +785,6 @@ def attempt_code_login(
     ref: str,
     full: bool = False,
 ) -> Tuple[str, Optional[str]]:
-    """
-    执行京东 code 登录流程。
-    返回 (cookie, risk_url)：
-      - 成功时 cookie 非空，risk_url 为 None
-      - 失败时 cookie 为空字符串，risk_url 可能有值
-    """
     label = "full" if full else "code-only"
     t0 = time.monotonic()
     session = CookieOpener()
@@ -796,12 +807,10 @@ def attempt_code_login(
     if cookie:
         _diag(f"[{label}] ✅ login_lt/follow_refresh 直接拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
         return normalize_pt_cookie(cookie), None
-    # SFS 交换
     sfs_cookie = sfs_exchange_pt_key(session, payload)
     if sfs_cookie:
         _diag(f"[{label}] ✅ SFS交换拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
         return normalize_pt_cookie(sfs_cookie), None
-    # PT OAuth 链
     exchange_error = ""
     try:
         pt_cookie = exchange_pt_cookie(yyb_server, ref)
@@ -811,7 +820,6 @@ def attempt_code_login(
         exchange_error = str(exc)
         _diag(f"[{label}] ❌ PT OAuth 链也失败：{exchange_error}")
     _diag(f"[{label}] ❌ 全部手段均未拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-    # 提取风险认证 URL
     risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
     message = response_message(payload)
     raw_payload_snippet = ""
@@ -833,6 +841,216 @@ def attempt_code_login(
     ) if risk_url else RuntimeError(
         (message or "login_lt 未返回 pt_key/pt_pin 或可用 ACRJUrl") + suffix
     )
+
+
+# ========== 京东 wskey → cookie 转换（新增）==========
+
+def wskey_to_cookie(wskey: str) -> Tuple[str, str]:
+    """
+    使用京东 wskey 换取 pt_key/pt_pin cookie。
+
+    wskey 是京东 APP/小程序登录后的长期令牌，格式如 "AAJ..."。
+    调用京东 genToken API（action=to）可将 wskey 转换为短期 cookie。
+
+    返回 (cookie_string, pt_pin)。
+    """
+    wskey = str(wskey or "").strip()
+    if not wskey:
+        raise ValueError("wskey 不能为空")
+    if not wskey.startswith("AAJ"):
+        _diag("  ⚠ wskey 不以 AAJ 开头，尝试继续...")
+
+    t0 = time.monotonic()
+
+    # ---- 策略 1：JD genToken API (action=to) + app_login_jump ----
+    # 这是京东官方将 wskey 转换为 cookie 的标准两步流程
+    cookie = _wskey_genToken_to_cookie(wskey)
+    if cookie:
+        pin = cookie_pin(cookie)
+        _diag(f"✅ genToken 成功，pt_key 类型={pt_key_type(cookie)}，用时{time.monotonic()-t0:.1f}s")
+        return cookie, pin
+
+    # ---- 策略 2：wskey 直接访问京东页面激活登录态 ----
+    cookie = _wskey_qrlogin_to_cookie(wskey)
+    if cookie:
+        pin = cookie_pin(cookie)
+        _diag(f"✅ 页面激活成功，pt_key 类型={pt_key_type(cookie)}，用时{time.monotonic()-t0:.1f}s")
+        return cookie, pin
+
+    raise RuntimeError("wskey 转 cookie 失败：所有策略均未返回有效的 pt_key/pt_pin")
+
+
+def _wskey_genToken_to_cookie(wskey: str) -> str:
+    """
+    策略 1：通过 JD genToken API 将 wskey 转换为 pt_key/pt_pin。
+
+    京东 APP 端的 genToken 接口：
+    POST https://api.m.jd.com/client.action?functionId=genToken
+    Body: body={"action":"to","token":"<wskey>"}&appid=jd_android&client=android&...
+    """
+    session = CookieOpener()
+
+    # 构造请求体（form-urlencoded 格式）
+    inner_body = json.dumps({"action": "to", "token": wskey}, separators=(",", ":"))
+    form_data = urllib.parse.urlencode({
+        "body": inner_body,
+        "appid": "jd_android",
+        "client": "android",
+        "clientVersion": "12.0.0",
+        "networkType": "wifi",
+        "functionId": "genToken",
+        "t": str(int(time.time() * 1000)),
+    })
+
+    headers = {
+        "User-Agent": JD_WSKEY_UA,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "*/*",
+        "Accept-Language": "zh-Hans-CN;q=1",
+        "Cookie": f"wskey={wskey};",
+    }
+
+    genToken_url = "https://api.m.jd.com/client.action?functionId=genToken"
+    status, response_headers, raw = request_text(
+        "POST", genToken_url, headers=headers, data=form_data, json_body=False,
+        opener=session,
+    )
+
+    _diag(f"  genToken HTTP {status}, body_len={len(raw)}")
+
+    # 从响应中提取 cookie
+    cookie = normalize_pt_cookie(session.cookie_jar)
+    if cookie:
+        return cookie
+
+    cookie = cookie_from_headers(response_headers)
+    if cookie:
+        return cookie
+
+    # 尝试从 JSON 响应体中解析
+    result = parse_jsonish(raw)
+    cookie = cookie_from_payload(result)
+    if cookie:
+        return cookie
+
+    # genToken 标准流程：本接口只返回 tokenKey，
+    # 需再访问 app_login_jump.html 才能拿到 pt_key/pt_pin
+    token_key = nested_string(result, ("tokenKey", "token_key", "token"))
+    if token_key:
+        _diag(f"  genToken 返回 tokenKey={token_key[:12]}...，走 app_login_jump 换 cookie")
+        cookie = _wskey_tokenKey_jump(token_key)
+        if cookie:
+            return cookie
+
+    return ""
+
+
+def _wskey_tokenKey_jump(token_key: str) -> str:
+    """
+    使用 genToken 返回的 tokenKey 访问 app_login_jump.html，
+    从响应 Set-Cookie 中提取 pt_key/pt_pin。
+
+    这是京东 APP 渠道 wskey 换 cookie 的标准第二步：
+      1) genToken(action=to) → tokenKey
+      2) GET plogin.m.jd.com/jd-mlogin/static/html/app_login_jump.html?tokenKey=xxx
+         → 302 响应 Set-Cookie: pt_key / pt_pin
+
+    注意：产出的 pt_key 以 app_open 开头属于 APP 渠道登录态的正常特征。
+    """
+    session = CookieOpener()
+    headers = {
+        "User-Agent": JD_WSKEY_UA,
+        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
+    }
+
+    current = "https://plogin.m.jd.com/jd-mlogin/static/html/app_login_jump.html?" + urllib.parse.urlencode(
+        {"tokenKey": token_key}
+    )
+
+    for hop in range(4):
+        status, response_headers, raw = request_text(
+            "GET", current, headers=headers, opener=session,
+        )
+        _diag(f"  app_login_jump[{hop}] HTTP {status}")
+
+        # pt_key/pt_pin 通常在 302 响应的 Set-Cookie 里
+        cookie = cookie_from_headers(response_headers)
+        if cookie:
+            return cookie
+        cookie = normalize_pt_cookie(session.cookie_jar)
+        if cookie:
+            return cookie
+
+        # 跟随一跳 Location（限制在京东域名内，防止跳到风控页外）
+        location = (
+            response_headers.get("Location")
+            or response_headers.get("location")
+            or ""
+        )
+        if not location or status not in {200, 301, 302, 303, 307, 308}:
+            break
+        current = urllib.parse.urljoin(current, location)
+        if not jd_pt_allowed_redirect(current):
+            break
+
+    return ""
+
+
+def _wskey_qrlogin_to_cookie(wskey: str) -> str:
+    """
+    策略 2：通过 wskey 模拟 JD 扫码登录换取 cookie。
+
+    部分场景下 genToken 不可用时，可以通过带上 wskey cookie 直接请求
+    JD 用户信息接口来激活 session 并获取 pt_key/pt_pin。
+    """
+    session = CookieOpener()
+
+    # step 1: 先用 wskey 访问 JD 首页激活 cookie
+    headers = {
+        "User-Agent": UA_DEFAULT,
+        "Cookie": f"wskey={wskey};",
+    }
+
+    status, response_headers, raw = request_text(
+        "GET", "https://home.m.jd.com/myJd/newhome.action",
+        headers=headers, opener=session,
+    )
+
+    _diag(f"  qrLogin step1 home HTTP {status}")
+
+    # step 2: 检查是否已经拿到了 pt_key/pt_pin
+    cookie = normalize_pt_cookie(session.cookie_jar)
+    if cookie:
+        return cookie
+    cookie = cookie_from_headers(response_headers)
+    if cookie:
+        return cookie
+
+    # step 3: 尝试访问 myJd 接口
+    # 注意：手动设置的 Cookie header 不会写入 cookie_jar，
+    # 因此每个请求都必须显式携带 wskey，否则等于裸请求
+    status2, response_headers2, raw2 = request_text(
+        "GET", "https://wq.jd.com/user/info/QueryJDUserInfo?sceneval=2",
+        headers={
+            "User-Agent": UA_DEFAULT,
+            "Referer": "https://home.m.jd.com/",
+            "Cookie": f"wskey={wskey};",
+        },
+        opener=session,
+    )
+
+    _diag(f"  qrLogin step2 QueryJDUserInfo HTTP {status2}")
+
+    cookie = normalize_pt_cookie(session.cookie_jar)
+    if not cookie:
+        cookie = cookie_from_headers(response_headers2)
+
+    # step 4: 尝试从响应中解析
+    if not cookie:
+        result = parse_jsonish(raw2)
+        cookie = cookie_from_payload(result)
+
+    return cookie
 
 
 # ========== Flask 应用 ==========
@@ -859,6 +1077,8 @@ def require_token(f):
 def health():
     return jsonify({"status": "ok"})
 
+
+# ---- 原有端点：code 登录 ----
 
 @app.route("/api/jd-check", methods=["POST"])
 @require_token
@@ -889,7 +1109,6 @@ def jd_check():
                 "message": "成功获取京东 cookie",
                 "pt_pin": pin,
             })
-        # cookie 为空但没异常 — 不应该发生，但防御性处理
         return jsonify({
             "status": "error",
             "jd_cookie": "",
@@ -898,13 +1117,11 @@ def jd_check():
             "pt_pin": "",
         }), 500
     except RuntimeError as exc:
-        # 尝试从异常中提取 risk_url
         exc_args = exc.args
         risk_url = None
         message = str(exc)
         if len(exc_args) > 1 and exc_args[1]:
             risk_url = exc_args[1]
-        # 检查是否是风控
         if risk_url or "ACRJUrl" in message or "风险" in message:
             return jsonify({
                 "status": "risk",
@@ -913,7 +1130,6 @@ def jd_check():
                 "message": message,
                 "pt_pin": "",
             })
-        # 如果包含登录缓存过期，也是 risk 类型
         if "登录缓存已过期" in message or "login_buffer expired" in message:
             return jsonify({
                 "status": "risk",
@@ -939,9 +1155,70 @@ def jd_check():
         }), 500
 
 
+# ---- 新增端点：wskey → cookie ----
+
+@app.route("/api/jd-wskey", methods=["POST"])
+@require_token
+def jd_wskey():
+    """
+    京东 wskey 转 cookie 接口。
+
+    请求体:
+        {"wskey": "AAJ..."}
+
+    响应:
+        {"status": "ok", "jd_cookie": "pt_key=...;pt_pin=...;", "pt_pin": "...", "message": "..."}
+        {"status": "error", "jd_cookie": "", "message": "..."}
+    """
+    body = request.get_json(silent=True) or {}
+    wskey = (body.get("wskey") or "").strip()
+
+    if not wskey:
+        return jsonify({
+            "status": "error",
+            "jd_cookie": "",
+            "message": "缺少 wskey 参数",
+            "pt_pin": "",
+        }), 400
+
+    try:
+        cookie, pin = wskey_to_cookie(wskey)
+        return jsonify({
+            "status": "ok",
+            "jd_cookie": cookie,
+            "risk_url": None,
+            "message": "wskey 转 cookie 成功",
+            "pt_pin": pin,
+            "pt_key_type": pt_key_type(cookie),
+        })
+    except ValueError as exc:
+        return jsonify({
+            "status": "error",
+            "jd_cookie": "",
+            "risk_url": "",
+            "message": str(exc),
+            "pt_pin": "",
+        }), 400
+    except RuntimeError as exc:
+        return jsonify({
+            "status": "error",
+            "jd_cookie": "",
+            "risk_url": "",
+            "message": str(exc),
+            "pt_pin": "",
+        }), 500
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "jd_cookie": "",
+            "risk_url": "",
+            "message": f"内部错误：{exc}",
+            "pt_pin": "",
+        }), 500
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    # 生产环境用 waitress
     try:
         from waitress import serve
         print(f"jdback 服务启动 (waitress)，端口 {port}")
