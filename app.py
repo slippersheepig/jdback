@@ -27,6 +27,7 @@ import urllib.request
 from http.cookiejar import CookieJar
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from curl_cffi.requests import Session as CurlSession
 from flask import Flask, request, jsonify
 
 # ========== 环境变量配置 ==========
@@ -51,20 +52,20 @@ ALLOW_INSECURE_YYB = _env("ALLOW_INSECURE_YYB", "0").lower() in {"1", "true", "y
 
 # 京东 wskey 转 cookie 的 UA（模拟京东 Android APP，与 appid=jd_android 渠道保持一致）
 JD_WSKEY_UA = (
-    "JD4Android/12.0.0;Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+    "JD4Android/13.6.4;Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 )
 
 # ========== 常量 ==========
 
 UA_WX = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
-    f"MicroMessenger/8.0.49 NetType/WIFI Language/zh_CN miniProgram/{JD_APPID}"
+    f"MicroMessenger/8.0.53 NetType/WIFI Language/zh_CN miniProgram/{JD_APPID}"
 )
 UA_DEFAULT = (
-    "Mozilla/5.0 (Linux; Android 10; Pixel 4 XL) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 "
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 "
     "Mobile Safari/537.36"
 )
 
@@ -670,9 +671,9 @@ def sfs_exchange_pt_key(opener: CookieOpener, payload: Dict[str, Any]) -> str:
 def jd_pt_headers() -> Dict[str, str]:
     return {
         "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 10; Pixel 4 XL) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 "
-            "Mobile Safari/537.36 MicroMessenger/7.0.20.1781 "
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 "
+            "Mobile Safari/537.36 MicroMessenger/8.0.53.2740 "
             "NetType/WIFI MiniProgramEnv/Windows WindowsWechat/WMPF"
         ),
         "Accept": (
@@ -883,23 +884,23 @@ def wskey_to_cookie(wskey: str) -> Tuple[str, str]:
 def _wskey_genToken_to_cookie(wskey: str) -> str:
     """
     策略 1：通过 JD genToken API 将 wskey 转换为 pt_key/pt_pin。
-
-    京东 APP 端的 genToken 接口：
-    POST https://api.m.jd.com/client.action?functionId=genToken
-    Body: body={"action":"to","token":"<wskey>"}&appid=jd_android&client=android&...
     """
-    session = CookieOpener()
-
-    # 构造请求体（form-urlencoded 格式）
     inner_body = json.dumps({"action": "to", "token": wskey}, separators=(",", ":"))
     form_data = urllib.parse.urlencode({
         "body": inner_body,
         "appid": "jd_android",
         "client": "android",
-        "clientVersion": "12.0.0",
+        "clientVersion": "13.6.4",
         "networkType": "wifi",
         "functionId": "genToken",
         "t": str(int(time.time() * 1000)),
+        "build": "100860",
+        "partner": "tencent",
+        "osVersion": "14",
+        "d_brand": "google",
+        "d_model": "Pixel8Pro",
+        "sdkVersion": "33",
+        "lang": "zh_CN",
     })
 
     headers = {
@@ -908,56 +909,55 @@ def _wskey_genToken_to_cookie(wskey: str) -> str:
         "Accept": "*/*",
         "Accept-Language": "zh-Hans-CN;q=1",
         "Cookie": f"wskey={wskey};",
+        "Accept-Encoding": "gzip, deflate, br",
     }
 
     genToken_url = "https://api.m.jd.com/client.action?functionId=genToken"
-    status, response_headers, raw = request_text(
-        "POST", genToken_url, headers=headers, data=form_data, json_body=False,
-        opener=session,
-    )
+    
+    session = CurlSession(impersonate="chrome120")
+    try:
+        resp = session.post(
+            genToken_url,
+            headers=headers,
+            data=form_data,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        _diag(f"  genToken 请求异常: {exc}")
+        return ""
 
-    _diag(f"  genToken HTTP {status}, body_len={len(raw)}")
+    _diag(f"  genToken HTTP {resp.status_code}, body_len={len(resp.content)}")
 
-    # 从响应中提取 cookie
-    cookie = normalize_pt_cookie(session.cookie_jar)
+    # 提取 cookies
+    cookie_str = "; ".join([f"{k}={v}" for k, v in session.cookies.items()])
+    cookie = normalize_pt_cookie(cookie_str)
     if cookie:
         return cookie
 
-    cookie = cookie_from_headers(response_headers)
+    cookie = cookie_from_headers(dict(resp.headers))
     if cookie:
         return cookie
 
-    # 尝试从 JSON 响应体中解析
-    result = parse_jsonish(raw)
+    result = parse_jsonish(resp.text)
     cookie = cookie_from_payload(result)
     if cookie:
         return cookie
 
-    # genToken 标准流程：本接口只返回 tokenKey，
-    # 需再访问 app_login_jump.html 才能拿到 pt_key/pt_pin
     token_key = nested_string(result, ("tokenKey", "token_key", "token"))
     if token_key:
         _diag(f"  genToken 返回 tokenKey={token_key[:12]}...，走 app_login_jump 换 cookie")
-        cookie = _wskey_tokenKey_jump(token_key)
+        cookie = _wskey_tokenKey_jump(session, token_key)
         if cookie:
             return cookie
 
     return ""
 
 
-def _wskey_tokenKey_jump(token_key: str) -> str:
+def _wskey_tokenKey_jump(session: CurlSession, token_key: str) -> str:
     """
-    使用 genToken 返回的 tokenKey 访问 app_login_jump.html，
-    从响应 Set-Cookie 中提取 pt_key/pt_pin。
-
-    这是京东 APP 渠道 wskey 换 cookie 的标准第二步：
-      1) genToken(action=to) → tokenKey
-      2) GET plogin.m.jd.com/jd-mlogin/static/html/app_login_jump.html?tokenKey=xxx
-         → 302 响应 Set-Cookie: pt_key / pt_pin
-
-    注意：产出的 pt_key 以 app_open 开头属于 APP 渠道登录态的正常特征。
+    使用 genToken 返回的 tokenKey 访问 app_login_jump.html
     """
-    session = CookieOpener()
     headers = {
         "User-Agent": JD_WSKEY_UA,
         "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
@@ -968,26 +968,25 @@ def _wskey_tokenKey_jump(token_key: str) -> str:
     )
 
     for hop in range(4):
-        status, response_headers, raw = request_text(
-            "GET", current, headers=headers, opener=session,
-        )
-        _diag(f"  app_login_jump[{hop}] HTTP {status}")
+        try:
+            resp = session.get(current, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=False)
+        except Exception as exc:
+            _diag(f"  app_login_jump 请求异常: {exc}")
+            break
+            
+        _diag(f"  app_login_jump[{hop}] HTTP {resp.status_code}")
 
-        # pt_key/pt_pin 通常在 302 响应的 Set-Cookie 里
-        cookie = cookie_from_headers(response_headers)
+        cookie_str = "; ".join([f"{k}={v}" for k, v in session.cookies.items()])
+        cookie = normalize_pt_cookie(cookie_str)
         if cookie:
             return cookie
-        cookie = normalize_pt_cookie(session.cookie_jar)
+            
+        cookie = cookie_from_headers(dict(resp.headers))
         if cookie:
             return cookie
 
-        # 跟随一跳 Location（限制在京东域名内，防止跳到风控页外）
-        location = (
-            response_headers.get("Location")
-            or response_headers.get("location")
-            or ""
-        )
-        if not location or status not in {200, 301, 302, 303, 307, 308}:
+        location = resp.headers.get("Location") or resp.headers.get("location") or ""
+        if not location or resp.status_code not in {200, 301, 302, 303, 307, 308}:
             break
         current = urllib.parse.urljoin(current, location)
         if not jd_pt_allowed_redirect(current):
