@@ -13,7 +13,11 @@ wskey 是京东长期保活令牌，可通过 yyb_go 的 /wxapp/getJdWskey 接�
 
 from __future__ import annotations
 
+import base64
 import functools
+import hashlib
+import random
+import uuid
 import hmac
 import ipaddress
 import json
@@ -56,7 +60,73 @@ JD_WSKEY_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 )
 
+# ── 京东 APP genToken 签名（移植自 Zy143L/wskey；sign 必需，缺失会得到 {"code":"1","echo":"no access"}）──
+_JD_SIGN_ARR = [0x37, 0x92, 0x44, 0x68, 0xA5, 0x3D, 0xCC, 0x7F, 0xBB, 0x0F, 0xD9, 0x88, 0xEE, 0x9A, 0xE9, 0x5A]
+_JD_SIGN_KEY = b"80306f4370b39fd5630ad0529f77adb6"
+JD_GENTOKEN_BODY = '{"to":"https%3a%2f%2fplogin.m.jd.com%2fjd-mlogin%2fstatic%2fhtml%2fappjmp_blank.html"}'
+JD_APPJMP_TO = "https://plogin.m.jd.com/jd-mlogin/static/html/appjmp_blank.html"
+
+
+def _jd_sign_core(par: bytes) -> bytes:
+    arr = _JD_SIGN_ARR
+    key2 = _JD_SIGN_KEY
+    out = [0] * len(par)
+    for i in range(len(par)):
+        r0 = int(par[i])
+        r2 = arr[i & 0xF]
+        r4 = int(key2[i & 7])
+        r0 = r2 ^ r0
+        r0 = r0 ^ r4
+        r0 = r0 + r2
+        r2 = r2 ^ r0
+        r2 = r2 ^ int(key2[i & 7])
+        out[i] = r2 & 0xFF
+    return bytes(out)
+
+
+def _jd_gen_sign(function_id: str, body: str, uu: str, client: str, cv: str, st: int, sv: str) -> str:
+    raw = "functionId=%s&body=%s&uuid=%s&client=%s&clientVersion=%s&st=%s&sv=%s" % (
+        function_id, body, uu, client, cv, st, sv)
+    return hashlib.md5(base64.b64encode(_jd_sign_core(raw.encode()))).hexdigest()
+
+
+def _jd_b64e(s: str) -> str:
+    a = "KLMNOPQRSTABCDEFGHIJUVWXYZabcdopqrstuvwxefghijklmnyz0123456789+/"
+    b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    return base64.b64encode(s.encode()).decode().translate(str.maketrans(a, b))
+
+
+def _jd_app_ua(st: int, aid: str, oaid: str) -> str:
+    return ('jdapp;android;11.1.4;;;appBuild/98176;ef/1;ep/{"hdid":"JM9F1ywUPwflvMIpYPok0tt5k9kW4ArJEU3lfLhxBqw=",'
+            '"ts":%s,"ridx":-1,"cipher":{"sv":"CJS=","ad":"%s","od":"%s","ov":"CzO=","ud":"%s"},'
+            '"ciphertype":5,"version":"1.2.0","appname":"com.jingdong.app.mall"};'
+            'Mozilla/5.0 (Linux; Android 12; M2102K1C Build/SKQ1.220303.001; wv) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Version/4.0 Chrome/97.0.4692.98 Mobile Safari/537.36'
+            % (st, aid, oaid, aid))
+
+
+def _wskey_cookie_header(cred: str) -> str:
+    """把录入的凭证串规范成 genToken 需要的 Cookie。
+    实测（2026-10 验证）：genToken 必须同时带 ``wskey=`` 和 ``pin=``（用 ``pt_pin=`` 会失败）。
+    支持输入 "pin=xxx;wskey=AAJ..." 或裸 "AAJ..."。"""
+    raw = str(cred or "").strip().rstrip(";")
+    if "wskey=" not in raw:
+        raw = "wskey=" + raw
+    return raw + ";"
+
+
+def _jd_classic_params(suid: str, ep: str, st: int, sv: str, sign: str) -> dict:
+    return {
+        "functionId": "genToken", "clientVersion": "11.1.4", "build": "98176", "client": "android",
+        "partner": "google", "oaid": suid, "sdkVersion": "31", "lang": "zh_CN", "harmonyOs": "0",
+        "networkType": "UNKNOWN", "uemps": "0-2", "ext": '{"prstate": "0", "pvcStu": "1"}',
+        "eid": "eidAcef08121fds9MoeSDdMRQ1aUTyb1TyPr2zKHk5Asiauw+K/WvS1Ben1cH6N0UnBd7lNM50XEa2kfCcA2wwThkxZc1MuCNtfU/oAMGBqadgres4BU",
+        "ef": "1", "ep": ep, "st": st, "sv": sv, "sign": sign,
+    }
+
+
 # ========== 常量 ==========
+
 
 UA_WX = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
@@ -883,41 +953,40 @@ def wskey_to_cookie(wskey: str) -> Tuple[str, str]:
 
 def _wskey_genToken_to_cookie(wskey: str) -> str:
     """
-    策略 1：通过 JD genToken API 将 wskey 转换为 pt_key/pt_pin。
-    """
-    inner_body = json.dumps({"action": "to", "token": wskey}, separators=(",", ":"))
-    form_data = urllib.parse.urlencode({
-        "body": inner_body,
-        "appid": "jd_android",
-        "client": "android",
-        "clientVersion": "13.6.4",
-        "networkType": "wifi",
-        "functionId": "genToken",
-        "t": str(int(time.time() * 1000)),
-        "build": "100860",
-        "partner": "tencent",
-        "osVersion": "14",
-        "d_brand": "google",
-        "d_model": "Pixel8Pro",
-        "sdkVersion": "33",
-        "lang": "zh_CN",
-    })
+    策略 1：genToken（**带 APP 签名**，必需）→ tokenKey → appjmp → pt_key/pt_pin。
 
+    注意：不带 sign 会得到 {"code":"1","echo":"no access"}；凭证无效时 JD 返回
+    tokenKey="xxx"（失效哨兵），此处按失败处理。
+    """
+    suid = "".join(str(uuid.uuid4()).split("-"))[16:]
+    buid = _jd_b64e(suid)
+    st = round(time.time() * 1000)
+    sv = random.choice(["102", "111", "120"])
+    # sign 必须用与下面发送的同一组 suid/st/sv
+    sign = _jd_gen_sign("genToken", JD_GENTOKEN_BODY, suid, "android", "11.1.4", st, sv)
+    ep = json.dumps({
+        "hdid": "JM9F1ywUPwflvMIpYPok0tt5k9kW4ArJEU3lfLhxBqw=", "ts": st, "ridx": -1,
+        "cipher": {"area": "CV8yEJUzXzU0CNG0XzK=", "d_model": "JWunCVVidRTr", "wifiBssid": "dW5hbw93bq==",
+                   "osVersion": "CJS=", "d_brand": "WQvrb21f", "screen": "CJuyCMenCNq=",
+                   "uuid": buid, "aid": buid, "openudid": buid},
+        "ciphertype": 5, "version": "1.2.0", "appname": "com.jingdong.app.mall",
+    }).replace(" ", "")
+    params = _jd_classic_params(suid, ep, st, sv, sign)
+    form_data = "body=" + urllib.parse.quote(JD_GENTOKEN_BODY, safe="") + "&"
     headers = {
-        "User-Agent": JD_WSKEY_UA,
+        "User-Agent": _jd_app_ua(st, buid, buid),
+        "Cookie": _wskey_cookie_header(wskey),
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "charset": "UTF-8",
+        "Accept-Encoding": "br,gzip,deflate",
         "Accept": "*/*",
-        "Accept-Language": "zh-Hans-CN;q=1",
-        "Cookie": f"wskey={wskey};",
-        "Accept-Encoding": "gzip, deflate, br",
     }
 
-    genToken_url = "https://api.m.jd.com/client.action?functionId=genToken"
-    
     session = CurlSession(impersonate="chrome120")
     try:
         resp = session.post(
-            genToken_url,
+            "https://api.m.jd.com/client.action",
+            params=params,
             headers=headers,
             data=form_data,
             timeout=REQUEST_TIMEOUT,
@@ -929,70 +998,45 @@ def _wskey_genToken_to_cookie(wskey: str) -> str:
 
     _diag(f"  genToken HTTP {resp.status_code}, body_len={len(resp.content)}")
 
-    # 提取 cookies
-    cookie_str = "; ".join([f"{k}={v}" for k, v in session.cookies.items()])
-    cookie = normalize_pt_cookie(cookie_str)
-    if cookie:
-        return cookie
-
-    cookie = cookie_from_headers(dict(resp.headers))
-    if cookie:
-        return cookie
-
     result = parse_jsonish(resp.text)
-    cookie = cookie_from_payload(result)
-    if cookie:
-        return cookie
-
-    token_key = nested_string(result, ("tokenKey", "token_key", "token"))
-    if token_key:
-        _diag(f"  genToken 返回 tokenKey={token_key[:12]}...，走 app_login_jump 换 cookie")
-        cookie = _wskey_tokenKey_jump(session, token_key)
-        if cookie:
-            return cookie
-
-    return ""
+    token_key = str(result.get("tokenKey") or "").strip()
+    if not token_key or token_key == "xxx":
+        _diag(f"  genToken 未返回有效 tokenKey（{token_key or '空'}）：{resp.text[:200]}")
+        return ""
+    _diag(f"  genToken 拿到 tokenKey={token_key[:12]}…，走 appjmp 换 cookie")
+    return _wskey_tokenKey_jump(session, token_key, wskey)
 
 
-def _wskey_tokenKey_jump(session: CurlSession, token_key: str) -> str:
+def _wskey_tokenKey_jump(session: CurlSession, token_key: str, wskey: str) -> str:
     """
-    使用 genToken 返回的 tokenKey 访问 app_login_jump.html
+    用 tokenKey 走京东 appjmp 换出 pt_key/pt_pin（经典链路 un.m.jd.com/cgi-bin/app/appjmp）。
     """
     headers = {
-        "User-Agent": JD_WSKEY_UA,
-        "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.8",
+        "User-Agent": _jd_app_ua(round(time.time() * 1000), "x", "x"),
+        "x-requested-with": "com.jingdong.app.mall",
     }
-
-    current = "https://plogin.m.jd.com/jd-mlogin/static/html/app_login_jump.html?" + urllib.parse.urlencode(
-        {"tokenKey": token_key}
+    current = "https://un.m.jd.com/cgi-bin/app/appjmp?" + urllib.parse.urlencode(
+        {"tokenKey": token_key, "to": JD_APPJMP_TO}
     )
-
     for hop in range(4):
         try:
             resp = session.get(current, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=False)
         except Exception as exc:
-            _diag(f"  app_login_jump 请求异常: {exc}")
+            _diag(f"  appjmp 请求异常: {exc}")
             break
-            
-        _diag(f"  app_login_jump[{hop}] HTTP {resp.status_code}")
-
-        cookie_str = "; ".join([f"{k}={v}" for k, v in session.cookies.items()])
-        cookie = normalize_pt_cookie(cookie_str)
+        _diag(f"  appjmp[{hop}] HTTP {resp.status_code}")
+        cookie_str = "; ".join(f"{k}={v}" for k, v in session.cookies.items())
+        cookie = normalize_pt_cookie(cookie_str) or cookie_from_headers(dict(resp.headers)) or normalize_pt_cookie(resp.text)
         if cookie:
             return cookie
-            
-        cookie = cookie_from_headers(dict(resp.headers))
-        if cookie:
-            return cookie
-
         location = resp.headers.get("Location") or resp.headers.get("location") or ""
         if not location or resp.status_code not in {200, 301, 302, 303, 307, 308}:
             break
         current = urllib.parse.urljoin(current, location)
         if not jd_pt_allowed_redirect(current):
             break
-
     return ""
+
 
 
 def _wskey_qrlogin_to_cookie(wskey: str) -> str:
@@ -1007,7 +1051,7 @@ def _wskey_qrlogin_to_cookie(wskey: str) -> str:
     # step 1: 先用 wskey 访问 JD 首页激活 cookie
     headers = {
         "User-Agent": UA_DEFAULT,
-        "Cookie": f"wskey={wskey};",
+        "Cookie": _wskey_cookie_header(wskey),
     }
 
     status, response_headers, raw = request_text(
@@ -1033,7 +1077,7 @@ def _wskey_qrlogin_to_cookie(wskey: str) -> str:
         headers={
             "User-Agent": UA_DEFAULT,
             "Referer": "https://home.m.jd.com/",
-            "Cookie": f"wskey={wskey};",
+            "Cookie": _wskey_cookie_header(wskey),
         },
         opener=session,
     )
@@ -1176,7 +1220,7 @@ def jd_wskey():
         return jsonify({
             "status": "error",
             "jd_cookie": "",
-            "message": "缺少 wskey 参数",
+            "message": "缺少 wskey 参数（登记格式：pin=你的pin;wskey=AAJ...，在京东APP抓包或 Stream 获取）",
             "pt_pin": "",
         }), 400
 
