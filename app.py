@@ -115,6 +115,33 @@ def _wskey_cookie_header(cred: str) -> str:
     return raw + ";"
 
 
+def _jd_cookie_alive(cookie: str) -> bool:
+    """用 cookie 调京东用户信息接口判断是否真的有效（返回 not login 即失败）。"""
+    ck = normalize_pt_cookie(cookie)
+    if not ck:
+        return False
+    if "fake" in ck.lower():
+        return False
+    try:
+        session = CurlSession(impersonate="chrome120")
+        try:
+            resp = session.get(
+                "https://me-api.jd.com/user_new/info/GetJDUserInfoUnion?agentId=1&appName=jd-cphdeveloper-m&key=",
+                headers={"Cookie": ck, "User-Agent": UA_DEFAULT, "Referer": "https://home.m.jd.com/"},
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
+            )
+            body = resp.text or ""
+        finally:
+            session.close()
+    except Exception as exc:
+        _diag(f"  活性校验异常: {exc}")
+        return False
+    if "not login" in body or "\"retcode\":\"1001\"" in body:
+        return False
+    return ('"assetInfo"' in body) or ('"userInfo"' in body) or ('"nickName"' in body) or ('"nickname"' in body)
+
+
 def _jd_classic_params(suid: str, ep: str, st: int, sv: str, sign: str) -> dict:
     return {
         "functionId": "genToken", "clientVersion": "11.1.4", "build": "98176", "client": "android",
@@ -918,37 +945,40 @@ def attempt_code_login(
 
 def wskey_to_cookie(wskey: str) -> Tuple[str, str]:
     """
-    使用京东 wskey 换取 pt_key/pt_pin cookie。
+    使用京东 wskey 换取 pt_key/pt_pin cookie（**带活性校验**）。
 
-    wskey 是京东 APP/小程序登录后的长期令牌，格式如 "AAJ..."。
-    调用京东 genToken API（action=to）可将 wskey 转换为短期 cookie。
+    wskey 是京东 APP 登录后的长期令牌，格式形如 "wskey=AAJ...;pin=..."。
+    链路：genToken（带 sign，Cookie 必须同时含 wskey= 和 pin=）→ tokenKey → appjmp → pt_key。
 
-    返回 (cookie_string, pt_pin)。
+    重要：**过期 wskey 时京东会返回 `pt_key=...fake...` 的假 key**，本函数会额外做一次
+    用户信息活性校验；只有真正有效才返回，否则抛错，便于上层明确提示"验证失败"。
     """
     wskey = str(wskey or "").strip()
     if not wskey:
         raise ValueError("wskey 不能为空")
-    if not wskey.startswith("AAJ"):
-        _diag("  ⚠ wskey 不以 AAJ 开头，尝试继续...")
 
     t0 = time.monotonic()
-
-    # ---- 策略 1：JD genToken API (action=to) + app_login_jump ----
-    # 这是京东官方将 wskey 转换为 cookie 的标准两步流程
-    cookie = _wskey_genToken_to_cookie(wskey)
-    if cookie:
+    tried = []
+    for name, fn in (("genToken", _wskey_genToken_to_cookie), ("qrlogin", _wskey_qrlogin_to_cookie)):
+        try:
+            cookie = fn(wskey)
+        except Exception as exc:
+            tried.append(f"{name}: {exc}")
+            continue
+        if not cookie:
+            tried.append(f"{name}: 未返回 cookie")
+            continue
+        if "fake" in cookie.lower():
+            tried.append(f"{name}: 京东返回了 fake pt_key（wskey 已失效）")
+            continue
+        if not _jd_cookie_alive(cookie):
+            tried.append(f"{name}: 换出的 cookie 活性校验失败")
+            continue
         pin = cookie_pin(cookie)
-        _diag(f"✅ genToken 成功，pt_key 类型={pt_key_type(cookie)}，用时{time.monotonic()-t0:.1f}s")
+        _diag(f"✅ {name} 成功且活性通过，pt_key类型={pt_key_type(cookie)}，用时{time.monotonic()-t0:.1f}s")
         return cookie, pin
 
-    # ---- 策略 2：wskey 直接访问京东页面激活登录态 ----
-    cookie = _wskey_qrlogin_to_cookie(wskey)
-    if cookie:
-        pin = cookie_pin(cookie)
-        _diag(f"✅ 页面激活成功，pt_key 类型={pt_key_type(cookie)}，用时{time.monotonic()-t0:.1f}s")
-        return cookie, pin
-
-    raise RuntimeError("wskey 转 cookie 失败：所有策略均未返回有效的 pt_key/pt_pin")
+    raise RuntimeError("wskey 无效或已失效（换不出可用 cookie）：" + "；".join(tried))
 
 
 def _wskey_genToken_to_cookie(wskey: str) -> str:
