@@ -359,10 +359,12 @@ def request_json(
     data: Any = None,
     opener: Optional[CookieOpener] = None,
     yyb_server: str = "",
+    api_token: str = "",
 ) -> Dict[str, Any]:
     merged_headers = dict(headers or {})
-    if YYB_API_TOKEN and yyb_server and url.startswith(yyb_server):
-        merged_headers.setdefault("Authorization", f"Bearer {YYB_API_TOKEN}")
+    token = api_token or YYB_API_TOKEN
+    if token and yyb_server and url.startswith(yyb_server):
+        merged_headers.setdefault("Authorization", f"Bearer {token}")
     status, _headers, raw = request_text(method, url, merged_headers, data, opener)
     payload = parse_jsonish(raw)
     if status < 200 or status >= 300:
@@ -543,6 +545,7 @@ def get_yyb_code(
     yyb_server: str,
     ref: str,
     app_id: Optional[str] = None,
+    api_token: str = "",
 ) -> str:
     request_app_id = str(app_id or JD_APPID).strip()
     payload = request_json(
@@ -550,6 +553,7 @@ def get_yyb_code(
         f"{yyb_server}/wxapp/getCode",
         data={"ref": ref, "app_id": request_app_id},
         yyb_server=yyb_server,
+        api_token=api_token,
     )
     result = unwrap_service_payload(payload)
     code = nested_string(result, ("wxCode", "wx_code", "jsCode", "jscode", "code"))
@@ -558,7 +562,7 @@ def get_yyb_code(
     return code
 
 
-def get_yyb_user_info(yyb_server: str, ref: str) -> Dict[str, str]:
+def get_yyb_user_info(yyb_server: str, ref: str, api_token: str = "") -> Dict[str, str]:
     payload = request_json(
         "POST",
         f"{yyb_server}/wxapp/operateWxData",
@@ -572,6 +576,7 @@ def get_yyb_user_info(yyb_server: str, ref: str) -> Dict[str, str]:
             },
         },
         yyb_server=yyb_server,
+        api_token=api_token,
     )
     result = unwrap_service_payload(payload)
     raw_data = nested_value(result, ("rawData", "raw_data"))
@@ -873,8 +878,8 @@ def jd_pt_cookie_login(code: str) -> str:
     )
 
 
-def exchange_pt_cookie(yyb_server: str, ref: str) -> str:
-    pt_code = get_yyb_code(yyb_server, ref, app_id=JD_PT_APPID)
+def exchange_pt_cookie(yyb_server: str, ref: str, api_token: str = "") -> str:
+    pt_code = get_yyb_code(yyb_server, ref, app_id=JD_PT_APPID, api_token=api_token)
     return jd_pt_cookie_login(pt_code)
 
 
@@ -882,12 +887,13 @@ def attempt_code_login(
     yyb_server: str,
     ref: str,
     full: bool = False,
+    api_token: str = "",
 ) -> Tuple[str, Optional[str]]:
     label = "full" if full else "code-only"
     t0 = time.monotonic()
     session = CookieOpener()
-    code = get_yyb_code(yyb_server, ref)
-    user_info = get_yyb_user_info(yyb_server, ref) if full else None
+    code = get_yyb_code(yyb_server, ref, api_token=api_token)
+    user_info = get_yyb_user_info(yyb_server, ref, api_token=api_token) if full else None
     _diag(f"[{label}] 已取得 " + ("code+userInfo" if full else "code") + f"，用时{time.monotonic()-t0:.1f}s")
     payload = call_login_lt(session, code, user_info)
     first_acrj = nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
@@ -911,7 +917,7 @@ def attempt_code_login(
         return normalize_pt_cookie(sfs_cookie), None
     exchange_error = ""
     try:
-        pt_cookie = exchange_pt_cookie(yyb_server, ref)
+        pt_cookie = exchange_pt_cookie(yyb_server, ref, api_token=api_token)
         _diag(f"[{label}] ✅ PT OAuth 链拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
         return pt_cookie, None
     except Exception as exc:
@@ -939,6 +945,29 @@ def attempt_code_login(
     ) if risk_url else RuntimeError(
         (message or "login_lt 未返回 pt_key/pt_pin 或可用 ACRJUrl") + suffix
     )
+
+
+def login_via_code(
+    yyb_server: str,
+    ref: str,
+    api_token: str = "",
+) -> Tuple[str, Optional[str]]:
+    """优先尝试 code-only 静默登录，若失败且非凭证失效则自动回退全参数重试（与 JDCode.py 保持一致）"""
+    try:
+        cookie, risk_url = attempt_code_login(yyb_server, ref, full=False, api_token=api_token)
+        if cookie or (risk_url and str(risk_url).strip()):
+            return cookie, risk_url
+    except Exception as code_error:
+        err_msg = str(code_error)
+        if "登录缓存已过期" in err_msg or "login_buffer expired" in err_msg:
+            raise
+        # 如果第一步就明确拿到了真实的 risk_url，直接向外抛出
+        if len(getattr(code_error, "args", ())) > 1 and code_error.args[1]:
+            raise
+        _diag(f"code-only 静默登录未完成（{err_msg}），自动改用全参数新 code 重试")
+
+    # 静默登录未完成，自动改用全参数（含 userInfo、signature、encryptedData）重试
+    return attempt_code_login(yyb_server, ref, full=True, api_token=api_token)
 
 
 # ========== 京东 wskey → cookie 转换（新增）==========
@@ -1160,6 +1189,7 @@ def jd_check():
     yyb_server_raw = (body.get("yyb_server") or "").strip()
     ref = (body.get("ref") or "").strip()
     app_id = (body.get("app_id") or "").strip() or None
+    api_token = (request.headers.get("X-YYB-API-Token") or body.get("api_token") or "").strip()
 
     if not yyb_server_raw:
         return jsonify({"status": "error", "message": "缺少 yyb_server 参数"}), 400
@@ -1172,7 +1202,7 @@ def jd_check():
         return jsonify({"status": "error", "message": str(exc)}), 400
 
     try:
-        cookie, risk_url = attempt_code_login(yyb_server, ref, full=False)
+        cookie, risk_url = login_via_code(yyb_server, ref, api_token=api_token)
         if cookie:
             pin = cookie_pin(cookie)
             return jsonify({
@@ -1182,10 +1212,18 @@ def jd_check():
                 "message": "成功获取京东 cookie",
                 "pt_pin": pin,
             })
+        if risk_url and str(risk_url).strip():
+            return jsonify({
+                "status": "risk",
+                "jd_cookie": "",
+                "risk_url": str(risk_url).strip(),
+                "message": "京东返回风险认证挑战",
+                "pt_pin": "",
+            })
         return jsonify({
             "status": "error",
             "jd_cookie": "",
-            "risk_url": risk_url,
+            "risk_url": "",
             "message": "未能获取 cookie",
             "pt_pin": "",
         }), 500
@@ -1194,23 +1232,24 @@ def jd_check():
         risk_url = None
         message = str(exc)
         if len(exc_args) > 1 and exc_args[1]:
-            risk_url = exc_args[1]
-        if risk_url or "ACRJUrl" in message or "风险" in message:
+            risk_url = str(exc_args[1]).strip()
+        # 仅当真正拿到了非空的 risk_url 时才返回 status: "risk"
+        if risk_url:
             return jsonify({
                 "status": "risk",
                 "jd_cookie": "",
-                "risk_url": risk_url or "",
+                "risk_url": risk_url,
                 "message": message,
                 "pt_pin": "",
             })
         if "登录缓存已过期" in message or "login_buffer expired" in message:
             return jsonify({
-                "status": "risk",
+                "status": "error",
                 "jd_cookie": "",
                 "risk_url": "",
-                "message": message,
+                "message": "应用宝账号登录缓存已过期，请重新扫码",
                 "pt_pin": "",
-            })
+            }), 409
         return jsonify({
             "status": "error",
             "jd_cookie": "",
