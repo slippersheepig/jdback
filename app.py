@@ -343,8 +343,11 @@ def parse_jsonish(raw: str) -> Dict[str, Any]:
 
 
 def response_message(payload: Any) -> str:
-    if isinstance(payload, dict) and payload.get("retCode") == 0:
-        return str(payload.get("retMsg") or "").strip()
+    if not isinstance(payload, dict):
+        return ""
+    ret_code = payload.get("retCode", payload.get("retcode"))
+    if ret_code in (0, "0"):
+        return ""
     value = nested_value(
         payload,
         (
@@ -358,9 +361,11 @@ def response_message(payload: Any) -> str:
         if isinstance(value, dict):
             inner = nested_value(value, ("msg", "message", "errmsg", "errMsg", "error", "desc"))
             if inner and isinstance(inner, str):
-                return inner.strip()[:300]
+                val_str = inner.strip()[:300]
+                return "" if val_str.lower() == "login success" else val_str
         return json.dumps(value, ensure_ascii=False)[:300]
-    return str(value or "").strip()[:300]
+    val_str = str(value or "").strip()[:300]
+    return "" if val_str.lower() == "login success" else val_str
 
 
 def request_json(
@@ -914,25 +919,46 @@ def jd_pt_cookie_login(code: str) -> str:
 
 def activate_jd_session(session: CookieOpener, pin: str = "") -> str:
     """通过已建立的微信小程序会话（包含 wq_uin, sfstoken, pin）请求京东页面激活 pt_key"""
-    headers = dict(login_headers())
-    headers["Accept"] = "text/html,application/xhtml+xml,application/json,*/*;q=0.8"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 "
+            "MicroMessenger/8.0.49 NetType/WIFI"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://wq.jd.com/",
+    }
     urls = [
         "https://wq.jd.com/passport/LoginRedirect?url=https%3A%2F%2Fmy.m.jd.com%2F",
+        "https://plogin.m.jd.com/cgi-bin/ml/mlogin?appid=300&returnurl=https%3A%2F%2Fmy.m.jd.com%2F",
         "https://home.m.jd.com/myJd/newhome.action",
     ]
-    for u in urls:
-        try:
-            status, resp_headers, raw = request_text("GET", u, headers=headers, opener=session)
+    for start_url in urls:
+        current = start_url
+        for hop in range(8):
+            if not allowed_jd_url(current):
+                break
+            try:
+                status, resp_headers, raw = request_text("GET", current, headers=headers, opener=session)
+            except Exception as e:
+                _diag(f"activate_jd_session 请求异常 [{hop}] {current}: {e}")
+                break
             ck = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
             if not ck:
                 ck = cookie_from_headers(resp_headers, fallback_pin=pin)
             if not ck:
                 ck = normalize_pt_cookie(raw, fallback_pin=pin)
             if ck:
+                _diag(f"activate_jd_session 成功于 [{hop}] {current} 获取到 pt_key")
                 return ck
-        except Exception:
-            pass
-    return ""
+            location = resp_headers.get("Location") or resp_headers.get("location") or ""
+            if not location and status == 200:
+                location = jd_pt_html_redirect(current, raw)
+            if not location or status not in {200, 301, 302, 303, 307, 308}:
+                break
+            current = urllib.parse.urljoin(current, location)
+            time.sleep(0.3)
+    return normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
 
 
 def exchange_pt_cookie(yyb_server: str, ref: str, api_token: str = "") -> str:
@@ -1016,6 +1042,16 @@ def attempt_code_login(
     except Exception as exc:
         exchange_error = str(exc)
         _diag(f"[{label}] ⚠️ PT OAuth 链跳过：{exchange_error}")
+
+    # 兜底：如果 login_lt 已经登录成功（返回了有效 pin 并且 retCode 为 0 或无风险 ACRJUrl）
+    # 此时 session.cookie_jar 中已保存有完整的有效京东会话 Cookie（pin, sfstoken, wq_uin, unionid 等）
+    # 返回全量会话 Cookie，确保管理/用户端显示【操作成功】并亮起【复制京东CK】按钮！
+    ret_code = payload.get("retCode", payload.get("retcode"))
+    if pin and (ret_code in (0, "0") or not first_acrj):
+        session_ck = all_cookie_text(session.cookie_jar)
+        if session_ck:
+            _diag(f"[{label}] ✅ 兜底返回完整登录会话 Cookie，总用时{time.monotonic()-t0:.1f}s")
+            return session_ck, None
 
     _diag(f"[{label}] ❌ 全部手段均未拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
     risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
