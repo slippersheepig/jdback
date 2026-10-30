@@ -284,6 +284,11 @@ def request_text(
             else urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT)
         )
         with response as resp:
+            if opener is not None and hasattr(opener, "cookie_jar"):
+                try:
+                    opener.cookie_jar.extract_cookies(resp, request)
+                except Exception:
+                    pass
             response_headers: Dict[str, str] = {}
             for header_name, header_value in resp.headers.items():
                 if header_name.lower() == "set-cookie" and header_name in response_headers:
@@ -296,6 +301,11 @@ def request_text(
                 resp.read().decode("utf-8", "replace"),
             )
     except urllib.error.HTTPError as exc:
+        if opener is not None and hasattr(opener, "cookie_jar"):
+            try:
+                opener.cookie_jar.extract_cookies(exc, request)
+            except Exception:
+                pass
         response_headers: Dict[str, str] = {}
         for header_name, header_value in exc.headers.items():
             if header_name.lower() == "set-cookie" and header_name in response_headers:
@@ -333,22 +343,23 @@ def parse_jsonish(raw: str) -> Dict[str, Any]:
 
 
 def response_message(payload: Any) -> str:
+    if isinstance(payload, dict) and payload.get("retCode") == 0:
+        return str(payload.get("retMsg") or "").strip()
     value = nested_value(
         payload,
         (
             "errmsg", "errMsg", "message", "msg", "error",
             "retmsg", "retMessage", "returnMsg", "return_msg",
             "err_msg", "desc", "description",
-            "info", "reason", "detail", "data",
+            "reason", "detail",
         ),
     )
     if isinstance(value, (dict, list)):
-        text = json.dumps(value, ensure_ascii=False)[:500]
         if isinstance(value, dict):
             inner = nested_value(value, ("msg", "message", "errmsg", "errMsg", "error", "desc"))
             if inner and isinstance(inner, str):
                 return inner.strip()[:300]
-        return text
+        return json.dumps(value, ensure_ascii=False)[:300]
     return str(value or "").strip()[:300]
 
 
@@ -440,40 +451,45 @@ def nested_string(payload: Any, keys: Iterable[str]) -> str:
 
 # ========== Cookie 工具 ==========
 
-def normalize_pt_cookie(cookie: Any) -> str:
+def normalize_pt_cookie(cookie: Any, fallback_pin: str = "") -> str:
     if isinstance(cookie, CookieJar):
         values: Dict[str, str] = {}
         for item in cookie:
-            if item.name in {"pt_key", "pt_pin"} and item.value:
+            if item.name in {"pt_key", "pt_pin", "pin", "jdpin"} and item.value:
                 values[item.name] = str(item.value)
-        if values.get("pt_key") and values.get("pt_pin"):
-            return f"pt_key={values['pt_key']};pt_pin={values['pt_pin']};"
+        pt_key = values.get("pt_key")
+        pt_pin = values.get("pt_pin") or values.get("pin") or values.get("jdpin") or fallback_pin
+        if pt_key and pt_pin:
+            return f"pt_key={pt_key};pt_pin={pt_pin};"
         return ""
 
     text = str(cookie or "")
     key_match = re.search(r"(?:^|[;?,\s])pt_key=([^;?,\s]+)", text)
-    pin_match = re.search(r"(?:^|[;?,\s])pt_pin=([^;?,\s]+)", text)
-    if not key_match or not pin_match:
-        return ""
-    return f"pt_key={key_match.group(1)};pt_pin={pin_match.group(1)};"
+    pin_match = re.search(r"(?:^|[;?,\s])(?:pt_pin|pin|jdpin)=([^;?,\s]+)", text)
+    if key_match:
+        pt_key = key_match.group(1)
+        pt_pin = pin_match.group(1) if pin_match else fallback_pin
+        if pt_pin:
+            return f"pt_key={pt_key};pt_pin={pt_pin};"
+    return ""
 
 
-def cookie_from_headers(headers: Dict[str, Any]) -> str:
+def cookie_from_headers(headers: Dict[str, Any], fallback_pin: str = "") -> str:
     for key, value in (headers or {}).items():
         if str(key).lower() not in {"set-cookie", "set-cookie2"}:
             continue
-        cookie = normalize_pt_cookie(str(value))
+        cookie = normalize_pt_cookie(str(value), fallback_pin=fallback_pin)
         if cookie:
             return cookie
     return ""
 
 
-def cookie_from_payload(payload: Any) -> str:
+def cookie_from_payload(payload: Any, fallback_pin: str = "") -> str:
     pt_key = nested_string(payload, ("pt_key", "ptKey"))
-    pt_pin = nested_string(payload, ("pt_pin", "ptPin"))
+    pt_pin = nested_string(payload, ("pt_pin", "ptPin", "pin", "jdpin")) or fallback_pin
     if pt_key and pt_pin:
-        return normalize_pt_cookie(f"pt_key={pt_key};pt_pin={pt_pin};")
-    return normalize_pt_cookie(str(payload or ""))
+        return normalize_pt_cookie(f"pt_key={pt_key};pt_pin={pt_pin};", fallback_pin=fallback_pin)
+    return normalize_pt_cookie(str(payload or ""), fallback_pin=fallback_pin)
 
 
 def jar_get(jar: CookieJar, name: str) -> str:
@@ -495,7 +511,7 @@ def all_cookie_text(jar: CookieJar) -> str:
 
 def cookie_pin(cookie: str) -> str:
     pure = normalize_pt_cookie(cookie)
-    match = re.search(r"(?:^|[;,\s])pt_pin=([^;,\s]+)", pure)
+    match = re.search(r"(?:^|[;,\s])(?:pt_pin|pin|jdpin)=([^;,\s]+)", pure or cookie)
     return match.group(1) if match else ""
 
 
@@ -560,6 +576,24 @@ def get_yyb_code(
     if len(code) < 8 or code in {"0", "200", "201"}:
         raise RuntimeError("应用宝 getCode 未返回有效一次性 code")
     return code
+
+
+def get_yyb_wskey(yyb_server: str, ref: str, api_token: str = "") -> str:
+    try:
+        payload = request_json(
+            "POST",
+            f"{yyb_server}/wxapp/getJdWskey",
+            data={"ref": ref, "app_id": JD_APPID},
+            yyb_server=yyb_server,
+            api_token=api_token,
+        )
+        result = unwrap_service_payload(payload)
+        wskey = nested_string(result, ("wskey", "jd_wskey", "wskey_jd"))
+        if not wskey or len(wskey) < 20:
+            return ""
+        return wskey
+    except Exception:
+        return ""
 
 
 def get_yyb_user_info(yyb_server: str, ref: str, api_token: str = "") -> Dict[str, str]:
@@ -751,14 +785,14 @@ def sfs_exchange_pt_key(opener: CookieOpener, payload: Dict[str, Any]) -> str:
     status, response_headers, raw = request_text(
         "GET", url, headers=login_headers(), opener=opener,
     )
-    cookie = normalize_pt_cookie(opener.cookie_jar)
+    cookie = normalize_pt_cookie(opener.cookie_jar, fallback_pin=pin)
     if cookie:
         return cookie
-    cookie = cookie_from_headers(response_headers)
+    cookie = cookie_from_headers(response_headers, fallback_pin=pin)
     if cookie:
         return cookie
     result = parse_jsonish(raw)
-    cookie = cookie_from_payload(result)
+    cookie = cookie_from_payload(result, fallback_pin=pin)
     if cookie:
         return cookie
     sfs_acrj = nested_string(login_info(result), ("ACRJUrl", "acrjUrl"))
@@ -878,9 +912,36 @@ def jd_pt_cookie_login(code: str) -> str:
     )
 
 
+def activate_jd_session(session: CookieOpener, pin: str = "") -> str:
+    """通过已建立的微信小程序会话（包含 wq_uin, sfstoken, pin）请求京东页面激活 pt_key"""
+    headers = dict(login_headers())
+    headers["Accept"] = "text/html,application/xhtml+xml,application/json,*/*;q=0.8"
+    urls = [
+        "https://wq.jd.com/passport/LoginRedirect?url=https%3A%2F%2Fmy.m.jd.com%2F",
+        "https://home.m.jd.com/myJd/newhome.action",
+    ]
+    for u in urls:
+        try:
+            status, resp_headers, raw = request_text("GET", u, headers=headers, opener=session)
+            ck = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
+            if not ck:
+                ck = cookie_from_headers(resp_headers, fallback_pin=pin)
+            if not ck:
+                ck = normalize_pt_cookie(raw, fallback_pin=pin)
+            if ck:
+                return ck
+        except Exception:
+            pass
+    return ""
+
+
 def exchange_pt_cookie(yyb_server: str, ref: str, api_token: str = "") -> str:
-    pt_code = get_yyb_code(yyb_server, ref, app_id=JD_PT_APPID, api_token=api_token)
-    return jd_pt_cookie_login(pt_code)
+    try:
+        pt_code = get_yyb_code(yyb_server, ref, app_id=JD_PT_APPID, api_token=api_token)
+        return jd_pt_cookie_login(pt_code)
+    except Exception as exc:
+        _diag(f"PT OAuth 尝试跳过：{exc}")
+        return ""
 
 
 def attempt_code_login(
@@ -888,41 +949,74 @@ def attempt_code_login(
     ref: str,
     full: bool = False,
     api_token: str = "",
+    existing_session: Optional[CookieOpener] = None,
 ) -> Tuple[str, Optional[str]]:
     label = "full" if full else "code-only"
     t0 = time.monotonic()
-    session = CookieOpener()
+    session = existing_session or CookieOpener()
     code = get_yyb_code(yyb_server, ref, api_token=api_token)
     user_info = get_yyb_user_info(yyb_server, ref, api_token=api_token) if full else None
     _diag(f"[{label}] 已取得 " + ("code+userInfo" if full else "code") + f"，用时{time.monotonic()-t0:.1f}s")
     payload = call_login_lt(session, code, user_info)
-    first_acrj = nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
+    info = login_info(payload)
+    pin = nested_string(info, ("pin", "jdpin"))
+    first_acrj = nested_string(info, ("ACRJUrl", "acrjUrl"))
     if first_acrj:
         _diag(f"[{label}] login_lt 直接返回风险挑战：{risk_fingerprint(first_acrj)}")
     else:
         _diag(f"[{label}] login_lt 未触发风险挑战（retMsg={response_message(payload) or '(空)'}）")
-    cookie = normalize_pt_cookie(session.cookie_jar)
+    cookie = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
     if not cookie:
         cookie = str(getattr(session, "last_response_cookie", "") or "")
     if not cookie:
-        cookie = cookie_from_payload(payload)
-    if not cookie:
+        cookie = cookie_from_payload(payload, fallback_pin=pin)
+    if not cookie and first_acrj:
         cookie = follow_server_refresh(session, payload)
     if cookie:
         _diag(f"[{label}] ✅ login_lt/follow_refresh 直接拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return normalize_pt_cookie(cookie), None
+        return normalize_pt_cookie(cookie, fallback_pin=pin), None
+
+    # 尝试京东页面会话激活（带着已写入的 wq_uin, sfstoken, pin 换取 pt_key）
+    activated = activate_jd_session(session, pin=pin)
+    if activated:
+        _diag(f"[{label}] ✅ 会话激活拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+        return normalize_pt_cookie(activated, fallback_pin=pin), None
+
+    # 新链路：如果 login_lt 已经登录成功（返回了有效 pin 和 sfstoken 会话态）
+    # 但首次请求服务端尚在同步会话，等待 1.5 秒后复用已写入 cookie 的 session 再次调用 login_lt，立即签发 pt_key
+    if pin and not first_acrj:
+        _diag(f"[{label}] 京东会话已建立(pin={pin})，等待1.5s同步后再次请求login_lt换取pt_key...")
+        time.sleep(1.5)
+        try:
+            new_code = get_yyb_code(yyb_server, ref, api_token=api_token)
+            new_payload = call_login_lt(session, new_code, user_info)
+            new_cookie = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
+            if not new_cookie:
+                new_cookie = cookie_from_payload(new_payload, fallback_pin=pin)
+            if not new_cookie:
+                new_cookie = activate_jd_session(session, pin=pin)
+            if new_cookie:
+                _diag(f"[{label}] ✅ 活跃会话二次调用成功获取 pt_key，总用时{time.monotonic()-t0:.1f}s")
+                return normalize_pt_cookie(new_cookie, fallback_pin=pin), None
+        except Exception as retry_err:
+            _diag(f"[{label}] 二次调用尝试异常: {retry_err}")
+
+    # 新链路：login_lt 给了 sfstoken+pin 但没给 pt_key，用 sfstoken 换
     sfs_cookie = sfs_exchange_pt_key(session, payload)
     if sfs_cookie:
         _diag(f"[{label}] ✅ SFS交换拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return normalize_pt_cookie(sfs_cookie), None
+        return normalize_pt_cookie(sfs_cookie, fallback_pin=pin), None
+
     exchange_error = ""
     try:
         pt_cookie = exchange_pt_cookie(yyb_server, ref, api_token=api_token)
-        _diag(f"[{label}] ✅ PT OAuth 链拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return pt_cookie, None
+        if pt_cookie:
+            _diag(f"[{label}] ✅ PT OAuth 链拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+            return pt_cookie, None
     except Exception as exc:
         exchange_error = str(exc)
-        _diag(f"[{label}] ❌ PT OAuth 链也失败：{exchange_error}")
+        _diag(f"[{label}] ⚠️ PT OAuth 链跳过：{exchange_error}")
+
     _diag(f"[{label}] ❌ 全部手段均未拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
     risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
     message = response_message(payload)
@@ -953,8 +1047,9 @@ def login_via_code(
     api_token: str = "",
 ) -> Tuple[str, Optional[str]]:
     """优先尝试 code-only 静默登录，若失败且非凭证失效则自动回退全参数重试（与 JDCode.py 保持一致）"""
+    session = CookieOpener()
     try:
-        cookie, risk_url = attempt_code_login(yyb_server, ref, full=False, api_token=api_token)
+        cookie, risk_url = attempt_code_login(yyb_server, ref, full=False, api_token=api_token, existing_session=session)
         if cookie or (risk_url and str(risk_url).strip()):
             return cookie, risk_url
     except Exception as code_error:
@@ -966,8 +1061,8 @@ def login_via_code(
             raise
         _diag(f"code-only 静默登录未完成（{err_msg}），自动改用全参数新 code 重试")
 
-    # 静默登录未完成，自动改用全参数（含 userInfo、signature、encryptedData）重试
-    return attempt_code_login(yyb_server, ref, full=True, api_token=api_token)
+    # 静默登录未完成，自动改用全参数（含 userInfo、signature、encryptedData）重试，并继承会话
+    return attempt_code_login(yyb_server, ref, full=True, api_token=api_token, existing_session=session)
 
 
 # ========== 京东 wskey → cookie 转换（新增）==========
@@ -1220,13 +1315,29 @@ def jd_check():
                 "message": "京东返回风险认证挑战",
                 "pt_pin": "",
             })
+        # 尝试 WSKEY 自动回退
+        try:
+            wskey = get_yyb_wskey(yyb_server, ref, api_token=api_token)
+            if wskey:
+                cookie, pin = wskey_to_cookie(wskey)
+                if cookie:
+                    return jsonify({
+                        "status": "ok",
+                        "jd_cookie": cookie,
+                        "risk_url": None,
+                        "message": "成功获取京东 cookie",
+                        "pt_pin": pin,
+                    })
+        except Exception as ws_err:
+            _diag(f"WSKEY 回退转换尝试失败: {ws_err}")
+
         return jsonify({
             "status": "error",
             "jd_cookie": "",
             "risk_url": "",
             "message": "未能获取 cookie",
             "pt_pin": "",
-        }), 500
+        }), 200
     except RuntimeError as exc:
         exc_args = exc.args
         risk_url = None
@@ -1250,13 +1361,29 @@ def jd_check():
                 "message": "应用宝账号登录缓存已过期，请重新扫码",
                 "pt_pin": "",
             }), 409
+        # 在抛错前，同样尝试一次 WSKEY 自动回退
+        try:
+            wskey = get_yyb_wskey(yyb_server, ref, api_token=api_token)
+            if wskey:
+                cookie, pin = wskey_to_cookie(wskey)
+                if cookie:
+                    return jsonify({
+                        "status": "ok",
+                        "jd_cookie": cookie,
+                        "risk_url": None,
+                        "message": "成功获取京东 cookie",
+                        "pt_pin": pin,
+                    })
+        except Exception as ws_err:
+            _diag(f"WSKEY 回退转换尝试失败: {ws_err}")
+
         return jsonify({
             "status": "error",
             "jd_cookie": "",
             "risk_url": "",
             "message": message,
             "pt_pin": "",
-        }), 500
+        }), 200
     except Exception as exc:
         return jsonify({
             "status": "error",
@@ -1264,7 +1391,7 @@ def jd_check():
             "risk_url": "",
             "message": f"内部错误：{exc}",
             "pt_pin": "",
-        }), 500
+        }), 200
 
 
 # ---- 新增端点：wskey → cookie ----
