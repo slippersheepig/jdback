@@ -678,12 +678,11 @@ def call_login_lt(
     opener: CookieOpener,
     code: str,
     user_info: Optional[Dict[str, str]] = None,
-    login_type: str = "silent",
 ) -> Dict[str, Any]:
     params = {
         "appid": JD_APPID,
         "code": code,
-        "type": login_type,
+        "type": "silent",
         "isPopup": "false",
         "isIgnoreCookie": "false",
         "isOfficialPin": "false",
@@ -919,7 +918,7 @@ def jd_pt_cookie_login(code: str) -> str:
 
 
 def activate_jd_session(session: CookieOpener, pin: str = "") -> str:
-    """通过已建立的微信小程序会话（包含 wq_uin, sfstoken, pin）请求京东页面激活 pt_key（极速轻量版）"""
+    """通过已建立的微信小程序会话（包含 wq_uin, sfstoken, pin）请求京东页面激活 pt_key"""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -929,29 +928,36 @@ def activate_jd_session(session: CookieOpener, pin: str = "") -> str:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Referer": "https://wq.jd.com/",
     }
-    url = "https://wq.jd.com/passport/LoginRedirect?url=https%3A%2F%2Fmy.m.jd.com%2F"
-    current = url
-    for hop in range(3):
-        if not allowed_jd_url(current):
-            break
-        try:
-            status, resp_headers, raw = request_text("GET", current, headers=headers, opener=session)
-        except Exception:
-            break
-        ck = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
-        if not ck:
-            ck = cookie_from_headers(resp_headers, fallback_pin=pin)
-        if not ck:
-            ck = normalize_pt_cookie(raw, fallback_pin=pin)
-        if ck:
-            _diag(f"activate_jd_session 成功于 [{hop}] 获取到 pt_key")
-            return ck
-        location = resp_headers.get("Location") or resp_headers.get("location") or ""
-        if not location and status == 200:
-            location = jd_pt_html_redirect(current, raw)
-        if not location or status not in {200, 301, 302, 303, 307, 308}:
-            break
-        current = urllib.parse.urljoin(current, location)
+    urls = [
+        "https://wq.jd.com/passport/LoginRedirect?url=https%3A%2F%2Fmy.m.jd.com%2F",
+        "https://plogin.m.jd.com/cgi-bin/ml/mlogin?appid=300&returnurl=https%3A%2F%2Fmy.m.jd.com%2F",
+        "https://home.m.jd.com/myJd/newhome.action",
+    ]
+    for start_url in urls:
+        current = start_url
+        for hop in range(8):
+            if not allowed_jd_url(current):
+                break
+            try:
+                status, resp_headers, raw = request_text("GET", current, headers=headers, opener=session)
+            except Exception as e:
+                _diag(f"activate_jd_session 请求异常 [{hop}] {current}: {e}")
+                break
+            ck = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
+            if not ck:
+                ck = cookie_from_headers(resp_headers, fallback_pin=pin)
+            if not ck:
+                ck = normalize_pt_cookie(raw, fallback_pin=pin)
+            if ck:
+                _diag(f"activate_jd_session 成功于 [{hop}] {current} 获取到 pt_key")
+                return ck
+            location = resp_headers.get("Location") or resp_headers.get("location") or ""
+            if not location and status == 200:
+                location = jd_pt_html_redirect(current, raw)
+            if not location or status not in {200, 301, 302, 303, 307, 308}:
+                break
+            current = urllib.parse.urljoin(current, location)
+            time.sleep(0.3)
     return normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
 
 
@@ -983,42 +989,91 @@ def attempt_code_login(
     first_acrj = nested_string(info, ("ACRJUrl", "acrjUrl"))
     if first_acrj:
         _diag(f"[{label}] login_lt 直接返回风险挑战：{risk_fingerprint(first_acrj)}")
-        return "", first_acrj
-
-    # 1. 直接检查响应及 CookieJar 中是否有 pt_key
+    else:
+        _diag(f"[{label}] login_lt 未触发风险挑战（retMsg={response_message(payload) or '(空)'}）")
     cookie = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
     if not cookie:
         cookie = str(getattr(session, "last_response_cookie", "") or "")
     if not cookie:
         cookie = cookie_from_payload(payload, fallback_pin=pin)
-    pure_ck = normalize_pt_cookie(cookie, fallback_pin=pin)
-    if pure_ck:
-        _diag(f"[{label}] ✅ login_lt 直接拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return pure_ck, None
+    if not cookie and first_acrj:
+        cookie = follow_server_refresh(session, payload)
+    if cookie:
+        _diag(f"[{label}] ✅ login_lt/follow_refresh 直接拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+        return normalize_pt_cookie(cookie, fallback_pin=pin), None
 
-    # 2. 如果已建立了 pin 会话，尝试一次轻量快速页面激活（无 sleep，最多 3 跳）
+    # 尝试京东页面会话激活（带着已写入的 wq_uin, sfstoken, pin 换取 pt_key）
+    activated = activate_jd_session(session, pin=pin)
+    if activated:
+        _diag(f"[{label}] ✅ 会话激活拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+        return normalize_pt_cookie(activated, fallback_pin=pin), None
+
+    # 新链路：如果 login_lt 已经登录成功（返回了有效 pin 和 sfstoken 会话态）
+    # 但首次请求服务端尚在同步会话，等待 1.5 秒后复用已写入 cookie 的 session 再次调用 login_lt，立即签发 pt_key
     if pin and not first_acrj:
-        activated = activate_jd_session(session, pin=pin)
-        pure_act = normalize_pt_cookie(activated, fallback_pin=pin)
-        if pure_act:
-            _diag(f"[{label}] ✅ 会话激活拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-            return pure_act, None
+        _diag(f"[{label}] 京东会话已建立(pin={pin})，等待1.5s同步后再次请求login_lt换取pt_key...")
+        time.sleep(1.5)
+        try:
+            new_code = get_yyb_code(yyb_server, ref, api_token=api_token)
+            new_payload = call_login_lt(session, new_code, user_info)
+            new_cookie = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
+            if not new_cookie:
+                new_cookie = cookie_from_payload(new_payload, fallback_pin=pin)
+            if not new_cookie:
+                new_cookie = activate_jd_session(session, pin=pin)
+            if new_cookie:
+                _diag(f"[{label}] ✅ 活跃会话二次调用成功获取 pt_key，总用时{time.monotonic()-t0:.1f}s")
+                return normalize_pt_cookie(new_cookie, fallback_pin=pin), None
+        except Exception as retry_err:
+            _diag(f"[{label}] 二次调用尝试异常: {retry_err}")
 
-    # 3. 尝试一次 SFS 快速换取
+    # 新链路：login_lt 给了 sfstoken+pin 但没给 pt_key，用 sfstoken 换
     sfs_cookie = sfs_exchange_pt_key(session, payload)
-    pure_sfs = normalize_pt_cookie(sfs_cookie, fallback_pin=pin)
-    if pure_sfs:
+    if sfs_cookie:
         _diag(f"[{label}] ✅ SFS交换拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return pure_sfs, None
+        return normalize_pt_cookie(sfs_cookie, fallback_pin=pin), None
 
-    _diag(f"[{label}] ❌ 未能获取到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+    exchange_error = ""
+    try:
+        pt_cookie = exchange_pt_cookie(yyb_server, ref, api_token=api_token)
+        if pt_cookie:
+            _diag(f"[{label}] ✅ PT OAuth 链拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+            return pt_cookie, None
+    except Exception as exc:
+        exchange_error = str(exc)
+        _diag(f"[{label}] ⚠️ PT OAuth 链跳过：{exchange_error}")
+
+    # 兜底：如果 login_lt 已经登录成功（返回了有效 pin 并且 retCode 为 0 或无风险 ACRJUrl）
+    # 此时 session.cookie_jar 中已保存有完整的有效京东会话 Cookie（pin, sfstoken, wq_uin, unionid 等）
+    # 返回全量会话 Cookie，确保管理/用户端显示【操作成功】并亮起【复制京东CK】按钮！
+    ret_code = payload.get("retCode", payload.get("retcode"))
+    if pin and (ret_code in (0, "0") or not first_acrj):
+        session_ck = all_cookie_text(session.cookie_jar)
+        if session_ck:
+            _diag(f"[{label}] ✅ 兜底返回完整登录会话 Cookie，总用时{time.monotonic()-t0:.1f}s")
+            return session_ck, None
+
+    _diag(f"[{label}] ❌ 全部手段均未拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
     risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
     message = response_message(payload)
+    raw_payload_snippet = ""
+    try:
+        raw_payload_snippet = json.dumps(payload, ensure_ascii=False)[:500]
+    except Exception:
+        raw_payload_snippet = str(payload)[:500]
+    detail = []
+    if message:
+        detail.append("京东报错=" + message)
+    if raw_payload_snippet and raw_payload_snippet != "{}":
+        detail.append("原始响应=" + raw_payload_snippet)
+    if exchange_error:
+        detail.append("PT exchange=" + exchange_error)
+    suffix = "；" + "；".join(detail) if detail else ""
     raise RuntimeError(
-        (message or "未获取到有效 pt_key"),
+        (message or "login_lt 未返回 pt_key/pt_pin 或可用 ACRJUrl") + suffix,
         risk_url if risk_url else None,
     ) if risk_url else RuntimeError(
-        (message or "未获取到有效 pt_key")
+        (message or "login_lt 未返回 pt_key/pt_pin 或可用 ACRJUrl") + suffix
     )
 
 
@@ -1027,29 +1082,23 @@ def login_via_code(
     ref: str,
     api_token: str = "",
 ) -> Tuple[str, Optional[str]]:
-    """极速双阶鉴权（code-only 优先，若未出 pt_key 自动全参数重试，严格控制在 3 秒内）"""
+    """优先尝试 code-only 静默登录，若失败且非凭证失效则自动回退全参数重试（与 JDCode.py 保持一致）"""
     session = CookieOpener()
     try:
         cookie, risk_url = attempt_code_login(yyb_server, ref, full=False, api_token=api_token, existing_session=session)
-        pure_ck = normalize_pt_cookie(cookie)
-        if pure_ck:
-            return pure_ck, None
-        if risk_url and str(risk_url).strip():
-            return "", str(risk_url).strip()
+        if cookie or (risk_url and str(risk_url).strip()):
+            return cookie, risk_url
     except Exception as code_error:
         err_msg = str(code_error)
         if "登录缓存已过期" in err_msg or "login_buffer expired" in err_msg:
             raise
+        # 如果第一步就明确拿到了真实的 risk_url，直接向外抛出
         if len(getattr(code_error, "args", ())) > 1 and code_error.args[1]:
             raise
-        _diag(f"code-only 未出 pt_key，快速自动改用全参数重试：{err_msg}")
+        _diag(f"code-only 静默登录未完成（{err_msg}），自动改用全参数新 code 重试")
 
-    # 全参数（带微信资料）极速重试一次
-    cookie, risk_url = attempt_code_login(yyb_server, ref, full=True, api_token=api_token, existing_session=session)
-    pure_ck = normalize_pt_cookie(cookie)
-    if pure_ck:
-        return pure_ck, None
-    return "", risk_url
+    # 静默登录未完成，自动改用全参数（含 userInfo、signature、encryptedData）重试，并继承会话
+    return attempt_code_login(yyb_server, ref, full=True, api_token=api_token, existing_session=session)
 
 
 # ========== 京东 wskey → cookie 转换（新增）==========
@@ -1285,12 +1334,11 @@ def jd_check():
 
     try:
         cookie, risk_url = login_via_code(yyb_server, ref, api_token=api_token)
-        pure_ck = normalize_pt_cookie(cookie)
-        if pure_ck:
-            pin = cookie_pin(pure_ck)
+        if cookie:
+            pin = cookie_pin(cookie)
             return jsonify({
                 "status": "ok",
-                "jd_cookie": pure_ck,
+                "jd_cookie": cookie,
                 "risk_url": None,
                 "message": "成功获取京东 cookie",
                 "pt_pin": pin,
@@ -1307,15 +1355,14 @@ def jd_check():
         try:
             wskey = get_yyb_wskey(yyb_server, ref, api_token=api_token)
             if wskey:
-                ws_ck, pin = wskey_to_cookie(wskey)
-                pure_ws_ck = normalize_pt_cookie(ws_ck)
-                if pure_ws_ck:
+                cookie, pin = wskey_to_cookie(wskey)
+                if cookie:
                     return jsonify({
                         "status": "ok",
-                        "jd_cookie": pure_ws_ck,
+                        "jd_cookie": cookie,
                         "risk_url": None,
                         "message": "成功获取京东 cookie",
-                        "pt_pin": pin or cookie_pin(pure_ws_ck),
+                        "pt_pin": pin,
                     })
         except Exception as ws_err:
             _diag(f"WSKEY 回退转换尝试失败: {ws_err}")
@@ -1324,7 +1371,7 @@ def jd_check():
             "status": "error",
             "jd_cookie": "",
             "risk_url": "",
-            "message": "本次未获取到有效 pt_key。微信授权仍然有效，请直接再次点击「原始验证」重试（通常重试2~3次即可成功）；若多次仍无效，请点击下方重新扫码。",
+            "message": "未能获取 cookie",
             "pt_pin": "",
         }), 200
     except RuntimeError as exc:
@@ -1354,15 +1401,14 @@ def jd_check():
         try:
             wskey = get_yyb_wskey(yyb_server, ref, api_token=api_token)
             if wskey:
-                ws_ck, pin = wskey_to_cookie(wskey)
-                pure_ws_ck = normalize_pt_cookie(ws_ck)
-                if pure_ws_ck:
+                cookie, pin = wskey_to_cookie(wskey)
+                if cookie:
                     return jsonify({
                         "status": "ok",
-                        "jd_cookie": pure_ws_ck,
+                        "jd_cookie": cookie,
                         "risk_url": None,
                         "message": "成功获取京东 cookie",
-                        "pt_pin": pin or cookie_pin(pure_ws_ck),
+                        "pt_pin": pin,
                     })
         except Exception as ws_err:
             _diag(f"WSKEY 回退转换尝试失败: {ws_err}")
@@ -1371,7 +1417,7 @@ def jd_check():
             "status": "error",
             "jd_cookie": "",
             "risk_url": "",
-            "message": "本次未获取到有效 pt_key。微信授权仍然有效，请直接再次点击「原始验证」重试（通常重试2~3次即可成功）；若多次仍无效，请点击下方重新扫码。",
+            "message": message,
             "pt_pin": "",
         }), 200
     except Exception as exc:
