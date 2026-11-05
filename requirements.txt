@@ -1,3 +1,2 @@
 flask
 waitress
-curl_cffi
