@@ -324,6 +324,10 @@ def request_json(
     payload = parse_jsonish(raw)
     if status < 200 or status >= 300:
         message = response_message(payload)
+        if not message and raw.strip():
+            plain = re.sub(r"<[^>]+>", " ", raw)
+            plain = re.sub(r"\s+", " ", plain).strip()
+            message = plain[:200]
         if status == 409 and "login_buffer expired" in message.lower():
             message = "应用宝账号登录缓存已过期，请打开 /scan 重新扫码"
         suffix = f"：{message}" if message else ""
@@ -1024,45 +1028,65 @@ def attempt_code_login(
     label = "full" if full else "code-only"
     t0 = time.monotonic()
     session = existing_session or CookieOpener(proxy=JD_PROXY)
-    code = get_yyb_code(yyb_server, ref, app_id=app_id, api_token=api_token)
-    user_info = get_yyb_user_info(yyb_server, ref, app_id=app_id, api_token=api_token) if full else None
-    _diag(f"[{label}] 已取得 " + ("code+userInfo" if full else "code") + f"，用时{time.monotonic()-t0:.1f}s")
-    payload = call_login_lt(session, code, user_info, app_id=app_id)
-    info = login_info(payload)
-    pin = nested_string(info, ("pin", "jdpin"))
-    first_acrj = nested_string(info, ("ACRJUrl", "acrjUrl"))
-    if first_acrj:
-        _diag(f"[{label}] login_lt 直接返回风险挑战：{risk_fingerprint(first_acrj)}")
-    else:
-        _diag(f"[{label}] login_lt 未触发风险挑战（retMsg={response_message(payload) or '(空)'}）")
-    cookie = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
-    if not cookie:
-        cookie = normalize_pt_cookie(str(getattr(session, "last_response_cookie", "") or ""), fallback_pin=pin)
-    if not cookie:
-        cookie = cookie_from_payload(payload, fallback_pin=pin)
-    channel = f"login_lt_{'full' if full else 'code'}"
-    if not cookie and first_acrj:
-        cookie = follow_server_refresh(session, payload, app_id=app_id)
+    payload: Dict[str, Any] = {}
+    info: Dict[str, Any] = {}
+    pin = ""
+    first_acrj = ""
+    wxapp_error = ""
+
+    try:
+        code = get_yyb_code(yyb_server, ref, app_id=app_id, api_token=api_token)
+        user_info = get_yyb_user_info(yyb_server, ref, app_id=app_id, api_token=api_token) if full else None
+        _diag(f"[{label}] 已取得 " + ("code+userInfo" if full else "code") + f"，用时{time.monotonic()-t0:.1f}s")
+        payload = call_login_lt(session, code, user_info, app_id=app_id)
+        info = login_info(payload)
+        pin = nested_string(info, ("pin", "jdpin"))
+        first_acrj = nested_string(info, ("ACRJUrl", "acrjUrl"))
+    except Exception as exc:
+        err_text = str(exc)
+        if (
+            not full
+            or "登录缓存已过期" in err_text
+            or "login_buffer expired" in err_text
+            or "HTTP 401" in err_text
+        ):
+            raise
+        wxapp_error = err_text
+        _diag(f"[{label}] ⚠️ 小程序通道异常（{wxapp_error}），直接尝试 H5 PT OAuth(1254) 兜底")
+
+    if not wxapp_error:
+        if first_acrj:
+            _diag(f"[{label}] login_lt 直接返回风险挑战：{risk_fingerprint(first_acrj)}")
+        else:
+            _diag(f"[{label}] login_lt 未触发风险挑战（retMsg={response_message(payload) or '(空)'}）")
+        cookie = normalize_pt_cookie(session.cookie_jar, fallback_pin=pin)
+        if not cookie:
+            cookie = normalize_pt_cookie(str(getattr(session, "last_response_cookie", "") or ""), fallback_pin=pin)
+        if not cookie:
+            cookie = cookie_from_payload(payload, fallback_pin=pin)
+        channel = f"login_lt_{'full' if full else 'code'}"
+        if not cookie and first_acrj:
+            cookie = follow_server_refresh(session, payload, app_id=app_id)
+            if cookie:
+                channel = f"acrj_refresh_{'full' if full else 'code'}"
         if cookie:
-            channel = f"acrj_refresh_{'full' if full else 'code'}"
-    if cookie:
-        pure = normalize_pt_cookie(cookie, fallback_pin=pin)
-        _diag(f"[{label}] ✅ {channel} 拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return pure, None, extract_pt_key_meta(session, pure, channel=channel)
+            pure = normalize_pt_cookie(cookie, fallback_pin=pin)
+            _diag(f"[{label}] ✅ {channel} 拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+            return pure, None, extract_pt_key_meta(session, pure, channel=channel)
 
-    # code-only 阶段如果未直接拿到 pt_key，不要污染 session，也不要提前返回不含 pt_key 的 sfstoken/pin，
-    # 立即交由外层 login_via_code 升级为 full=True (携带 getUserInfo 全参数 + 已建立的 session Cookie) 重试！
-    if not full:
-        risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
-        msg = response_message(payload) or "code-only 未下发 pt_key"
-        raise RuntimeError(msg, risk_url if risk_url else None) if risk_url else RuntimeError(msg)
+        # code-only 阶段如果未直接拿到 pt_key，不要污染 session，也不要提前返回不含 pt_key 的 sfstoken/pin，
+        # 立即交由外层 login_via_code 升级为 full=True (携带 getUserInfo 全参数 + 已建立的 session Cookie) 重试！
+        if not full:
+            risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
+            msg = response_message(payload) or "code-only 未下发 pt_key"
+            raise RuntimeError(msg, risk_url if risk_url else None) if risk_url else RuntimeError(msg)
 
-    # full=True 阶段：如果已建立会话但首次全参数调用仍未签发 pt_key，尝试会话激活及 H5 PT OAuth(1254)
-    activated = activate_jd_session(session, pin=pin)
-    if activated:
-        pure = normalize_pt_cookie(activated, fallback_pin=pin)
-        _diag(f"[{label}] ✅ 会话激活拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
-        return pure, None, extract_pt_key_meta(session, pure, channel="activate_jd_session")
+        # full=True 阶段：如果已建立会话但首次全参数调用仍未签发 pt_key，尝试会话激活及 H5 PT OAuth(1254)
+        activated = activate_jd_session(session, pin=pin)
+        if activated:
+            pure = normalize_pt_cookie(activated, fallback_pin=pin)
+            _diag(f"[{label}] ✅ 会话激活拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
+            return pure, None, extract_pt_key_meta(session, pure, channel="activate_jd_session")
 
     exchange_error = ""
     try:
@@ -1076,7 +1100,7 @@ def attempt_code_login(
 
     _diag(f"[{label}] ❌ 全部手段均未拿到 pt_key，总用时{time.monotonic()-t0:.1f}s")
     risk_url = first_acrj or nested_string(login_info(payload), ("ACRJUrl", "acrjUrl"))
-    message = response_message(payload)
+    message = wxapp_error or response_message(payload)
     skey_present = bool(
         jar_get(session.cookie_jar, "wq_skey")
         or jar_get(session.cookie_jar, "skey")
