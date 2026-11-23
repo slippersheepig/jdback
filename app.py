@@ -329,7 +329,9 @@ def request_json(
             plain = re.sub(r"\s+", " ", plain).strip()
             message = plain[:200]
         if status == 409 and "login_buffer expired" in message.lower():
-            message = "应用宝账号登录缓存已过期，请打开 /scan 重新扫码"
+            detail_m = re.search(r"login_buffer expired\s*\((.+)\)\s*(?:;|$)", message, flags=re.IGNORECASE)
+            detail_part = f"（{detail_m.group(1).strip()}）" if detail_m and detail_m.group(1).strip() else ""
+            message = f"应用宝账号登录缓存已过期，请打开 /scan 重新扫码{detail_part}"
         suffix = f"：{message}" if message else ""
         raise RuntimeError(
             f"HTTP {status} {method.upper()} {redact_url(url)}{suffix}"
@@ -850,7 +852,15 @@ def get_yyb_h5_code(
                 break
             except Exception as exc:
                 last_err = exc
-                if "HTTP 404" in str(exc):
+                err_text = str(exc)
+                if (
+                    "HTTP 409" in err_text
+                    or "HTTP 401" in err_text
+                    or "登录缓存已过期" in err_text
+                    or "login_buffer expired" in err_text.lower()
+                ):
+                    raise RuntimeError(f"H5 OAuth 取码失败：{exc}") from exc
+                if "HTTP 404" in err_text:
                     continue
                 break
     raise RuntimeError(f"H5 OAuth 取码失败：{last_err}")
