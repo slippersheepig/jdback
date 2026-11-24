@@ -39,7 +39,7 @@ JD_PT_APP = "300"
 JD_PT_RETURN_URL = "https://my.m.jd.com/account/index.html"
 YYB_API_TOKEN = _env("YYB_API_TOKEN")
 JD_PROXY = _env("JD_PROXY")
-JD_LOGIN_MODE = _env("JD_LOGIN_MODE", "auto").lower()
+JD_LOGIN_MODE = _env("JD_LOGIN_MODE", "h5").lower()
 
 try:
     REQUEST_TIMEOUT = max(5, min(int(_env("REQUEST_TIMEOUT", "30")), 90))
@@ -300,10 +300,10 @@ def response_message(payload: Any) -> str:
         if isinstance(value, dict):
             inner = nested_value(value, ("msg", "message", "errmsg", "errMsg", "error", "desc"))
             if inner and isinstance(inner, str):
-                val_str = inner.strip()[:300]
+                val_str = inner.strip()[:1000]
                 return "" if val_str.lower() == "login success" else val_str
-        return json.dumps(value, ensure_ascii=False)[:300]
-    val_str = str(value or "").strip()[:300]
+        return json.dumps(value, ensure_ascii=False)[:1000]
+    val_str = str(value or "").strip()[:1000]
     return "" if val_str.lower() == "login success" else val_str
 
 
@@ -329,7 +329,11 @@ def request_json(
             plain = re.sub(r"\s+", " ", plain).strip()
             message = plain[:200]
         if status == 409 and "login_buffer expired" in message.lower():
-            detail_m = re.search(r"login_buffer expired\s*\((.+)\)\s*(?:;|$)", message, flags=re.IGNORECASE)
+            detail_m = re.search(
+                r"login_buffer expired\s*\((.+?)(?:\)\s*(?:;\s*re-scan required|$)|$)",
+                message,
+                flags=re.IGNORECASE,
+            )
             detail_part = f"（{detail_m.group(1).strip()}）" if detail_m and detail_m.group(1).strip() else ""
             message = f"应用宝账号登录缓存已过期，请打开 /scan 重新扫码{detail_part}"
         suffix = f"：{message}" if message else ""
@@ -853,15 +857,24 @@ def get_yyb_h5_code(
             except Exception as exc:
                 last_err = exc
                 err_text = str(exc)
-                if (
-                    "HTTP 409" in err_text
-                    or "HTTP 401" in err_text
-                    or "登录缓存已过期" in err_text
-                    or "login_buffer expired" in err_text.lower()
-                ):
-                    raise RuntimeError(f"H5 OAuth 取码失败：{exc}") from exc
+                err_lower = err_text.lower()
                 if "HTTP 404" in err_text:
                     continue
+                should_try_base = (
+                    try_scope != "snsapi_base"
+                    and (
+                        "h5 oauth" in err_lower
+                        or "business code=" in err_lower
+                        or "未返回有效一次性 code" in err_text
+                    )
+                    and "login_buffer expired" not in err_lower
+                    and "登录缓存已过期" not in err_text
+                    and "HTTP 409" not in err_text
+                    and "HTTP 401" not in err_text
+                    and "HTTP 403" not in err_text
+                )
+                if not should_try_base:
+                    raise RuntimeError(f"H5 OAuth 取码失败：{exc}") from exc
                 break
     raise RuntimeError(f"H5 OAuth 取码失败：{last_err}")
 
